@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <curand.h>
+#include "GPTSoVITS/model/gpu_kernels.h"
 #endif
 
 namespace GPTSoVITS::Model::GPU {
@@ -119,9 +120,25 @@ struct GPUSampler::Impl {
 
   Impl() : rng(std::random_device{}()) {
 #ifdef WITH_CUDA
-    cudaError_t err = curandCreateGenerator(&curand_gen, CURAND_RNG_PSEUDO_DEFAULT);
-    if (err != cudaSuccess) {
-      PrintError("[GPUSampler] Failed to create CURAND generator: {}", cudaGetErrorString(err));
+    curandStatus_t err = curandCreateGenerator(&curand_gen, CURAND_RNG_PSEUDO_DEFAULT);
+    if (err != CURAND_STATUS_SUCCESS) {
+      const char* err_str = "unknown";
+      switch (err) {
+        case CURAND_STATUS_SUCCESS: err_str = "success"; break;
+        case CURAND_STATUS_VERSION_MISMATCH: err_str = "version mismatch"; break;
+        case CURAND_STATUS_NOT_INITIALIZED: err_str = "not initialized"; break;
+        case CURAND_STATUS_ALLOCATION_FAILED: err_str = "allocation failed"; break;
+        case CURAND_STATUS_TYPE_ERROR: err_str = "type error"; break;
+        case CURAND_STATUS_OUT_OF_RANGE: err_str = "out of range"; break;
+        case CURAND_STATUS_LENGTH_NOT_MULTIPLE: err_str = "length not multiple"; break;
+        case CURAND_STATUS_DOUBLE_PRECISION_REQUIRED: err_str = "double precision required"; break;
+        case CURAND_STATUS_LAUNCH_FAILURE: err_str = "launch failure"; break;
+        case CURAND_STATUS_PREEXISTING_FAILURE: err_str = "preexisting failure"; break;
+        case CURAND_STATUS_INITIALIZATION_FAILED: err_str = "initialization failed"; break;
+        case CURAND_STATUS_ARCH_MISMATCH: err_str = "arch mismatch"; break;
+        case CURAND_STATUS_INTERNAL_ERROR: err_str = "internal error"; break;
+      }
+      PrintError("[GPUSampler] Failed to create CURAND generator: {}", err_str);
     }
 #endif
   }
@@ -145,9 +162,33 @@ std::unique_ptr<Tensor> GPUSampler::SampleTopK(
     float temperature) {
 #ifdef WITH_CUDA
   if (topk_values->IsCUDA() && topk_indices->IsCUDA()) {
-    // TODO: 实现 CUDA 版本的 top-k 采样
-    // 需要实现 CUDA kernel 来完成 softmax + multinomial sampling
-    PrintWarn("[GPUSampler] CUDA sampling not yet implemented, falling back to CPU");
+    // 使用 GPU 加速 softmax 计算，但 multinomial 采样仍在 CPU 上进行
+    try {
+      // 在 GPU 上拷贝并应用 softmax
+      auto softmax_values = topk_values->Clone();
+      cudaError_t err = LaunchSoftmaxKernel(
+          softmax_values->Data<float>(),
+          softmax_values->ElementCount(),
+          temperature);
+
+      if (err != cudaSuccess) {
+        PrintWarn("[GPUSampler] CUDA softmax failed: {}, falling back to CPU", cudaGetErrorString(err));
+        return SampleTopKCPU(topk_values, topk_indices, temperature);
+      }
+
+      // 同步等待kernel完成
+      cudaDeviceSynchronize();
+
+      // 将 softmax 后的值和索引拷贝到 CPU 进行采样
+      auto values_cpu = softmax_values->ToCPU();
+      auto indices_cpu = topk_indices->ToCPU();
+
+      // 使用 GPU 加速后的值进行 CPU 采样
+      return SampleTopKCPU(values_cpu.get(), indices_cpu.get(), temperature);
+    } catch (const std::exception& e) {
+      PrintWarn("[GPUSampler] CUDA sampling exception: {}, falling back to CPU", e.what());
+      return SampleTopKCPU(topk_values, topk_indices, temperature);
+    }
   }
 #endif
 
@@ -174,9 +215,32 @@ std::unique_ptr<Tensor> GPUTypeConverter::ConvertType(
 
 #ifdef WITH_CUDA
   if (src->IsCUDA()) {
-    // TODO: 实现 CUDA 版本的类型转换
-    // 需要实现 CUDA kernel 来完成类型转换
-    PrintWarn("[GPUTypeConverter] CUDA conversion not yet implemented, falling back to CPU");
+    // 使用 CUDA kernel 进行类型转换
+    try {
+      // 在目标设备上分配内存
+      auto dst = Tensor::Empty(src->Shape(), target_dtype, src->GetDevice());
+
+      // 启动类型转换 kernel
+      cudaError_t err = LaunchTypeConversionKernel(
+          src->Data(),
+          dst->Data(),
+          src->ElementCount(),
+          src->Type(),
+          target_dtype);
+
+      if (err != cudaSuccess) {
+        PrintWarn("[GPUTypeConverter] CUDA kernel failed: {}, falling back to CPU", cudaGetErrorString(err));
+        return ConvertTypeCPU(src, target_dtype);
+      }
+
+      // 同步等待kernel完成
+      cudaDeviceSynchronize();
+
+      return dst;
+    } catch (const std::exception& e) {
+      PrintWarn("[GPUTypeConverter] CUDA conversion exception: {}, falling back to CPU", e.what());
+      return ConvertTypeCPU(src, target_dtype);
+    }
   }
 #endif
 

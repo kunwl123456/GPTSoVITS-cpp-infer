@@ -1,13 +1,32 @@
-cmake_minimum_required(VERSION 3.17)
+cmake_minimum_required(VERSION 3.5)
 
 if (POLICY CMP0091)
   cmake_policy(SET CMP0091 NEW)
 endif ()
 
-project(gsv_cpp)
+project(gsv_cpp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 如果启用了 CUDA，设置 CUDA 编译选项
+if (ENABLE_CUDA)
+    enable_language(CUDA)
+    message(STATUS "CUDA language enabled")
+
+    # 设置 CUDA 编译选项，避免 MSVC 调试选项传递给 NVCC
+    # 注意：这些选项会自动传递给所有 CUDA 编译
+    set(CMAKE_CUDA_FLAGS_DEBUG "-lineinfo -restrict" CACHE STRING "CUDA debug flags" FORCE)
+    set(CMAKE_CUDA_FLAGS_RELEASE "-lineinfo -O3" CACHE STRING "CUDA release flags" FORCE)
+    set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-lineinfo -O2" CACHE STRING "CUDA relwithdebinfo flags" FORCE)
+    set(CMAKE_CUDA_FLAGS_MINSIZEREL "-lineinfo -Os" CACHE STRING "CUDA minsizerel flags" FORCE)
+endif()
+
+# 如果启用了 CUDA，启用 CUDA 语言
+if (ENABLE_CUDA)
+    enable_language(CUDA)
+    message(STATUS "CUDA language enabled")
+endif()
 
 # ==============================================================================
 # 编译选项配置
@@ -86,7 +105,14 @@ file(GLOB_RECURSE GPT_SOVITS_CPP_SOURCE
     "src/export/*.cpp"
 )
 
-add_library(gsv_lib ${GPT_SOVITS_CPP_SOURCE})
+# CUDA kernel files
+set(GPT_SOVITS_CUDA_SOURCE "")
+if (ENABLE_CUDA)
+    file(GLOB_RECURSE GPT_SOVITS_CUDA_SOURCE "src/*.cu")
+    message(STATUS "Found CUDA source files: ${GPT_SOVITS_CUDA_SOURCE}")
+endif()
+
+add_library(gsv_lib ${GPT_SOVITS_CPP_SOURCE} ${GPT_SOVITS_CUDA_SOURCE})
 target_include_directories(gsv_lib PUBLIC include)
 
 
@@ -106,11 +132,35 @@ if (ENABLE_CUDA)
     set(CUDAToolkit_ROOT "${CUDA_TOOLKIT_ROOT_DIR}")
   endif ()
 
-  target_compile_definitions(gsv_lib PRIVATE _ENABLE_CUDA_=1)
+  # 先查找 CUDA Toolkit
   find_package(CUDAToolkit REQUIRED)
 
+  target_compile_definitions(gsv_lib PRIVATE _ENABLE_CUDA_=1)
   target_compile_definitions(gsv_lib PUBLIC WITH_CUDA)
   list(APPEND BACKEND_LIBS CUDA::cudart)
+
+  if (GPT_SOVITS_CUDA_SOURCE)
+    set_source_files_properties(${GPT_SOVITS_CUDA_SOURCE} PROPERTIES LANGUAGE CUDA)
+
+    # 启用 CUDA 分离编译
+    set_target_properties(gsv_lib PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+    # 设置 CUDA 架构 (无设备测试,有需求自行修改)
+    set_target_properties(gsv_lib PROPERTIES CUDA_ARCHITECTURES "75;80;86")
+
+    # 设置 CUDA 标准
+    set_target_properties(gsv_lib PROPERTIES CUDA_STANDARD 17)
+
+    # 启用 CUDA 符号解析
+    set_target_properties(gsv_lib PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+    target_compile_options(gsv_lib PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W3>
+        $<$<COMPILE_LANGUAGE:CXX>:/GR>
+        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        )
+  endif()
 
 endif ()
 

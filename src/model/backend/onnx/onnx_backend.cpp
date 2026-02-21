@@ -1,5 +1,9 @@
 #include "GPTSoVITS/model/backend/onnx_backend.h"
 
+#ifdef WITH_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include <onnxruntime_cxx_api.h>
 
 #include <iostream>
@@ -127,19 +131,40 @@ std::vector<std::unique_ptr<Tensor>> ONNXBackend::InferCore(
     auto mem_info = val.GetTensorMemoryInfo();
     Device res_device(DeviceType::kCPU);
 
+    bool is_cuda = false;
     if (mem_info.GetDeviceType() == OrtMemoryInfoDeviceType_GPU ||
         std::string(mem_info.GetAllocatorName()) == "Cuda") {
       res_device = Device(DeviceType::kCUDA, mem_info.GetDeviceId());
+      is_cuda = true;
     }
 
-    // 转移 Ort::Value 所有权给 Tensor
-    // Ort::Value 不支持拷贝，必须移动到堆上由 Deleter 管理
-    auto* value_holder = new Ort::Value(std::move(val));
-    auto deleter = [value_holder](void*) { delete value_holder; };
-    void* data_ptr = value_holder->GetTensorMutableData<void>();
+    // 对于CUDA输出，必须深拷贝数据到Tensor自己管理的内存中
+    // 避免Ort::Value析构时释放CUDA内存导致访问违例（0xC0000005）
+    if (is_cuda) {
+#ifdef WITH_CUDA
+      // 创建新的Tensor并拷贝数据
+      auto new_tensor = Tensor::Empty(shape, dtype, res_device);
+      void* src_ptr = val.GetTensorMutableData<void>();
+      size_t bytes = new_tensor->ByteSize();
+      cudaError_t err = cudaMemcpy(new_tensor->Data(), src_ptr, bytes, cudaMemcpyDeviceToDevice);
+      if (err != cudaSuccess) {
+        PrintError("[ONNXBackend] Failed to copy CUDA output: {}", cudaGetErrorString(err));
+        throw std::runtime_error(cudaGetErrorString(err));
+      }
+      output_tensors.push_back(std::move(new_tensor));
+#else
+      THROW_ERROR("CUDA output provided but compiled without CUDA support.");
+#endif
+    } else {
+      // 对于CPU输出，可以使用零拷贝方式（转移Ort::Value所有权）
+      // Ort::Value 不支持拷贝，必须移动到堆上由 Deleter 管理
+      auto* value_holder = new Ort::Value(std::move(val));
+      auto deleter = [value_holder](void*) { delete value_holder; };
+      void* data_ptr = value_holder->GetTensorMutableData<void>();
 
-    output_tensors.push_back(
-        std::make_unique<Tensor>(data_ptr, shape, dtype, res_device, deleter));
+      output_tensors.push_back(
+          std::make_unique<Tensor>(data_ptr, shape, dtype, res_device, deleter));
+    }
   }
 
   return output_tensors;

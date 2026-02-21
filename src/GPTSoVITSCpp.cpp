@@ -364,16 +364,16 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
                                              Model::DeviceType::kCPU);
       idx_tensor->At<int64_t>(0) = i;
 
-      if (i == 0) {
-        PrintDebug("  GPT Step #0: idx={}, current_samples={}",
-                  idx_tensor->At<int64_t>(0), current_samples->At<int64_t>(0));
-        if (x_len && x_len->ElementCount() > 0) {
-          PrintDebug("  x_len={}", x_len->At<int64_t>(0));
-        }
-        if (y_len && y_len->ElementCount() > 0) {
-          PrintDebug("  y_len={}", y_len->At<int64_t>(0));
-        }
-      }
+      // if (i == 0) {
+      //   PrintDebug("  GPT Step #0: idx={}, current_samples={}",
+      //             idx_tensor->At<int64_t>(0), current_samples->At<int64_t>(0));
+      //   if (x_len && x_len->ElementCount() > 0) {
+      //     PrintDebug("  x_len={}", x_len->ToCPU()->At<int64_t>(0));
+      //   }
+      //   if (y_len && y_len->ElementCount() > 0) {
+      //     PrintDebug("  y_len={}", y_len->ToCPU()->At<int64_t>(0));
+      //   }
+      // }
 
       auto step_output = m_gpt_step_model->Step(
           current_samples.get(), k_cache.get(), v_cache.get(), idx_tensor.get(),

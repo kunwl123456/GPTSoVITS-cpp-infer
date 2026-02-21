@@ -6,7 +6,7 @@
 #include "GPTSoVITS/GPTSoVITS.h"
 #include "GPTSoVITS/model/backend/onnx_backend.h"
 
-#ifdef _HOST_WONDOWS_
+#ifdef _HOST_WINDOWS_
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #else
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
@@ -124,8 +124,6 @@ int main() {
           R"(./看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物钟表小子.wav)"),
       "看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物钟表小子");
 
-  // Test inference (currently returns empty audio as SoVITS generation is not
-  // yet implemented)
   auto result = gsv.InferSpeaker("firefly", "你好，这是一段测试文本。");
   if (result) {
     result->SaveToFile("output_test.wav");

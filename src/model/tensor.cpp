@@ -13,6 +13,9 @@
 
 #include <xtl/xhalf_float.hpp>
 
+#include "GPTSoVITS/model/gpu_kernels.h"
+#include "GPTSoVITS/plog.h"
+
 namespace GPTSoVITS::Model {
 
 namespace {
@@ -201,24 +204,36 @@ std::unique_ptr<Tensor> Tensor::ToType(DataType dtype) const {
     return Clone();
   }
 
-  // 优先尝试 GPU 转换（如果在 CUDA 上）
+  // 如果在 CUDA 上，使用 GPU kernel 进行类型转换
   if (device_.type == DeviceType::kCUDA) {
 #ifdef WITH_CUDA
-    // 尝试使用 GPU 转换（通过 GPUTypeConverter）
-    // 暂时使用现有实现，后续会替换为真正的 GPU 转换
-    auto cpu_src = ToCPU();
-    auto cpu_dst = Empty(shape_, dtype, Device(DeviceType::kCPU));
+    // 使用 GPU kernel 进行类型转换
+    auto dst = Empty(shape_, dtype, device_);
 
-    DispatchIn(cpu_src->Data(), dtype_, cpu_dst->Data(), dtype, numel_);
+    // 启动类型转换 kernel（源数据在当前tensor，目标数据在dst）
+    cudaError_t err = GPU::LaunchTypeConversionKernel(
+        Data(),           // 源数据指针
+        dst->Data(),      // 目标数据指针
+        numel_,
+        dtype_,
+        dtype);
 
-    return cpu_dst->ToDevice(device_);
+    if (err != cudaSuccess) {
+      PrintWarn("CUDA type conversion kernel failed: {}, falling back to CPU", cudaGetErrorString(err));
+      // 回退到 CPU 转换
+      auto cpu_src = ToCPU();
+      auto cpu_dst = Empty(shape_, dtype, Device(DeviceType::kCPU));
+      DispatchIn(cpu_src->Data(), dtype_, cpu_dst->Data(), dtype, numel_);
+      return cpu_dst->ToDevice(device_);
+    }
+
+    cudaDeviceSynchronize();
+    return dst;
 #else
     // 无 CUDA 支持，回退到 CPU 转换
     auto cpu_src = ToCPU();
     auto cpu_dst = Empty(shape_, dtype, Device(DeviceType::kCPU));
-
     DispatchIn(cpu_src->Data(), dtype_, cpu_dst->Data(), dtype, numel_);
-
     return cpu_dst->ToDevice(device_);
 #endif
   }
