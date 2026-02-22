@@ -1,6 +1,7 @@
 ///
 // 流推理示例 - 实时音频生成
-//
+// 不要编译，有bug
+
 
 #include <iostream>
 #include <memory>
@@ -8,13 +9,13 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
-
+#include "cpptrace/from_current.hpp"
 #include "GPTSoVITS/GPTSoVITS.h"
 #include "GPTSoVITS/StreamingPipeline.h"
 #include "GPTSoVITS/EdgePipeline.h"
 #include "GPTSoVITS/model/backend/onnx_backend.h"
 
-#ifdef _HOST_WINDOWS_
+#ifdef _HOST_WINDOWS__
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #else
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
@@ -108,7 +109,7 @@ int main(int argc, char* argv[]) {
   std::system("chcp 65001");
 #endif
 
-  try {
+CPPTRACE_TRY {
     std::cout << "========================================" << std::endl;
     std::cout << "  GPT-SoVITS-CPP 流推理示例" << std::endl;
     std::cout << "========================================" << std::endl;
@@ -183,16 +184,18 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[3/4] 导入说话人数据包..." << std::endl;
     if (!edge_pipeline->ImportSpeaker(speaker_package, speaker_name)) {
       std::cerr << "错误：无法导入说话人数据包" << std::endl;
-      return 1;
+      exit(1);
     }
 
     std::cout << "  已导入说话人: " << speaker_name << std::endl;
 
     // 配置流推理参数
     GPTSoVITS::StreamingConfig streaming_config;
-    streaming_config.chunk_length = 24;      // 分块长度
-    streaming_config.pause_length = 0.3f;    // 段落间停顿
-    streaming_config.fade_length = 1280;     // 淡入淡出长度
+    streaming_config.chunk_length = 24;      // 分块长度（token数）
+    streaming_config.pause_length = 0.3f;    // 段落间停顿（秒）
+    streaming_config.fade_length = 1280;     // 淡入淡出长度（采样点）
+    streaming_config.h_len = 512;            // 历史token长度
+    streaming_config.l_len = 16;             // 前瞻token长度
     streaming_config.enable_fade = true;     // 启用淡入淡出
 
     // 创建流推理 Pipeline
@@ -245,14 +248,16 @@ int main(int argc, char* argv[]) {
                   << rtf << std::endl;
       }
 
-      std::cout << "\n 流推理完成！" << std::endl;
+      std::cout << "\n流推理完成！" << std::endl;
     } else {
-      std::cerr << "\n 流推理失败！" << std::endl;
-      return 1;
+      std::cerr << "\n流推理失败！" << std::endl;
+      exit(1);
     }
 
-  } catch (const std::exception& e) {
-    std::cerr << "\n 错误: " << e.what() << std::endl;
+} CPPTRACE_CATCH(const std::exception& e) {
+  std::cerr<<"Exception: "<<e.what()<<std::endl;
+  cpptrace::from_current_exception().print();
+    std::cerr << "\n错误: " << e.what() << std::endl;
     return 1;
   }
 

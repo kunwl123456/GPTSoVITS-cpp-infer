@@ -240,9 +240,18 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     auto& target_phones = target_bert_res->PhoneSeq;
     auto& target_bert = target_bert_res->BertSeq;
 
-    // Concatenate reference and target
-    auto all_phones = ConcatTensor(ref_phones.get(), target_phones.get(), 0);
-    auto all_bert = ConcatTensor(ref_bert.get(), target_bert.get(), 1);
+    // Get target device and dtype
+    auto target_device = m_gpt_encoder_model->GetModel()->GetDevice();
+    auto phone_dtype = m_gpt_encoder_model->GetModel()->GetInputDataType("phoneme_ids");
+    auto bert_dtype = m_gpt_encoder_model->GetModel()->GetInputDataType("bert_feature");
+
+    auto ref_phones_final = ref_phones->To(target_device, phone_dtype);
+    auto target_phones_final = target_phones->To(target_device, phone_dtype);
+    auto all_phones = ConcatTensor(ref_phones_final.get(), target_phones_final.get(), 0);
+
+    auto ref_bert_final = ref_bert->To(target_device, bert_dtype);
+    auto target_bert_final = target_bert->To(target_device, bert_dtype);
+    auto all_bert = ConcatTensor(ref_bert_final.get(), target_bert_final.get(), 1);
 
     PrintDebug("  ref_bert shape: [{}, {}, {}]",
               ref_bert->Shape().size() > 0 ? ref_bert->Shape()[0] : 0,

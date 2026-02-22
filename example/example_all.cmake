@@ -17,12 +17,15 @@ target_link_libraries(gpt_sovits_cpp_test_pipline_cpp PUBLIC gsv_lib)
 add_executable(gpt_sovits_cpp_streaming example/streaming/streaming_inference.cpp)
 target_link_libraries(gpt_sovits_cpp_streaming PUBLIC gsv_lib)
 
-# Distributed inference examples
+# Distributed inference examples (legacy)
 add_executable(gpt_sovits_cpp_cloud_create example/distributed/cloud_create_speaker.cpp)
 target_link_libraries(gpt_sovits_cpp_cloud_create PUBLIC gsv_lib)
 
 add_executable(gpt_sovits_cpp_edge_inference example/distributed/edge_inference.cpp)
 target_link_libraries(gpt_sovits_cpp_edge_inference PUBLIC gsv_lib)
+
+add_executable(gpt_sovits_cpp_multi_speaker example/distributed/multi_speaker.cpp)
+target_link_libraries(gpt_sovits_cpp_multi_speaker PUBLIC gsv_lib)
 
 
 if (WIN32 AND COMMAND auto_copy_backend_dlls)
@@ -32,4 +35,5 @@ if (WIN32 AND COMMAND auto_copy_backend_dlls)
   auto_copy_backend_dlls(gpt_sovits_cpp_streaming)
   auto_copy_backend_dlls(gpt_sovits_cpp_cloud_create)
   auto_copy_backend_dlls(gpt_sovits_cpp_edge_inference)
+  auto_copy_backend_dlls(gpt_sovits_cpp_multi_speaker)
 endif()

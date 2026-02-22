@@ -151,19 +151,24 @@ std::vector<std::unique_ptr<Tensor>> ONNXBackend::InferCore(
         PrintError("[ONNXBackend] Failed to copy CUDA output: {}", cudaGetErrorString(err));
         throw std::runtime_error(cudaGetErrorString(err));
       }
+      // 同步确保拷贝完成
+      err = cudaDeviceSynchronize();
+      if (err != cudaSuccess) {
+        PrintError("[ONNXBackend] CUDA sync failed: {}", cudaGetErrorString(err));
+      }
       output_tensors.push_back(std::move(new_tensor));
 #else
       THROW_ERROR("CUDA output provided but compiled without CUDA support.");
 #endif
     } else {
-      // 对于CPU输出，可以使用零拷贝方式（转移Ort::Value所有权）
-      // Ort::Value 不支持拷贝，必须移动到堆上由 Deleter 管理
-      auto* value_holder = new Ort::Value(std::move(val));
-      auto deleter = [value_holder](void*) { delete value_holder; };
-      void* data_ptr = value_holder->GetTensorMutableData<void>();
-
-      output_tensors.push_back(
-          std::make_unique<Tensor>(data_ptr, shape, dtype, res_device, deleter));
+      // CPU输出必须深拷贝数据
+      // ONNX Runtime 的 IoBinding 内部缓冲区可能在后续推理中被复用
+      // 导致之前返回的 Tensor 数据指针变成无效（use-after-free）
+      auto new_tensor = Tensor::Empty(shape, dtype, res_device);
+      void* src_ptr = val.GetTensorMutableData<void>();
+      size_t bytes = new_tensor->ByteSize();
+      std::memcpy(new_tensor->Data(), src_ptr, bytes);
+      output_tensors.push_back(std::move(new_tensor));
     }
   }
 
@@ -250,6 +255,20 @@ bool ONNXBackend::Load(const std::string& model_path, const BackendConfig& confi
 }
 
 DataType ONNXBackend::DetermineInputType(DataType model_type) const {
+  // 整型输入（如 pred_semantic, text_seq 等）不应被转换为浮点类型
+  // 否则会导致 Gather 操作的索引值被错误解释，产生越界错误
+  switch (model_type) {
+    case DataType::kInt64:
+    case DataType::kInt32:
+    case DataType::kInt8:
+    case DataType::kUInt8:
+      // 整型输入保持原样，不进行精度转换
+      return model_type;
+    default:
+      break;
+  }
+
+  // 仅对浮点类型进行精度转换
   switch (config_.precision) {
     case PrecisionMode::kAuto:
       return model_type;

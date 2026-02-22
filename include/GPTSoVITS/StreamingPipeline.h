@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <deque>
 
 #include "GPTSoVITS/AudioTools.h"
 #include "GPTSoVITS/EdgePipeline.h"
@@ -23,8 +24,8 @@ struct StreamingConfig {
   int chunk_length = 24;          // 分块长度（token 数）
   float pause_length = 0.3f;      // 段落间停顿（秒）
   int fade_length = 1280;         // 淡入淡出长度（采样点数）
-  int h_len = 512;                // 历史长度（采样点数）
-  int l_len = 16;                 // 前瞻长度（采样点数）
+  int h_len = 512;                // 历史token长度（用于平滑过渡）
+  int l_len = 16;                 // 前瞻token长度（用于平滑过渡）
   bool enable_fade = true;        // 是否启用淡入淡出
   bool enable_mute_matrix = false; // 是否使用静音矩阵分割
 };
@@ -44,7 +45,6 @@ struct AudioChunk {
 /**
  * @brief 流推理 Pipeline
  *
- * 支持实时流式音频生成
  */
 class StreamingPipeline {
 public:
@@ -71,7 +71,7 @@ public:
    * @param text 目标文本
    * @param text_lang 文本语言
    * @param callback 音频分块回调
-   * @param temperature 温度参数
+   * @param sample_config 采样配置
    * @param noise_scale 噪声缩放
    * @param speed 速度
    * @return 是否成功
@@ -81,7 +81,7 @@ public:
       const std::string& text,
       const std::string& text_lang,
       AudioChunkCallback callback,
-      float temperature = 1.0f,
+      const Model::SampleConfig& sample_config,
       float noise_scale = 0.5f,
       float speed = 1.0f);
 
@@ -102,18 +102,11 @@ private:
   StreamingConfig m_config;
 
   /**
-   * @brief 处理单个文本段落
-   * @param speaker_info 说话人信息
-   * @param segment 文本段落
-   * @param segment_index 段落索引
-   * @param callback 音频分块回调
-   * @param temperature 温度参数
-   * @param noise_scale 噪声缩放
-   * @param speed 速度
-   * @param prev_fade_out 前一个分块的淡出数据
-   * @return 最后一个分块的淡出数据
+   * @brief 流式处理单个文本段落
+   * 
+   * 核心流推理逻辑：边生成边解码
    */
-  std::vector<float> ProcessSegment(
+  std::vector<float> ProcessSegmentStreaming(
       const SpeakerInfo& speaker_info,
       const std::string& segment,
       int segment_index,
@@ -124,21 +117,15 @@ private:
       const std::vector<float>& prev_fade_out);
 
   /**
-   * @brief 分割语义 tokens
-   * @param semantic_tokens 语义 tokens
-   * @param chunk_queue 分块队列
-   * @return 分割后的分块数
-   */
-  int SplitSemanticTokens(
-      const std::vector<int64_t>& semantic_tokens,
-      std::vector<std::vector<int64_t>>& chunk_queue);
-
-  /**
    * @brief 解码音频分块
-   * @param chunk_tokens 分块 tokens
-   * @param history_tokens 历史 tokens
-   * @param lookahead_tokens 前瞻 tokens
+   * 
+   * 使用历史和前瞻token实现平滑过渡
+   * 
+   * @param chunk_tokens 当前分块的tokens
+   * @param history_tokens 历史tokens（用于平滑过渡）
+   * @param lookahead_tokens 前瞻tokens（用于平滑过渡）
    * @param speaker_info 说话人信息
+   * @param target_phones 目标音素序列
    * @param noise_scale 噪声缩放
    * @param speed 速度
    * @return 解码后的音频数据
@@ -148,15 +135,12 @@ private:
       const std::vector<int64_t>& history_tokens,
       const std::vector<int64_t>& lookahead_tokens,
       const SpeakerInfo& speaker_info,
+      const std::vector<int64_t>& target_phones,
       float noise_scale,
       float speed);
 
   /**
    * @brief 应用淡入淡出
-   * @param audio 音频数据
-   * @param fade_in 淡入数据
-   * @param fade_out 淡出数据
-   * @return 处理后的音频
    */
   std::vector<float> ApplyFade(
       const std::vector<float>& audio,
@@ -165,13 +149,16 @@ private:
 
   /**
    * @brief 生成停顿音频
-   * @param duration 停顿时长（秒）
-   * @param sampling_rate 采样率
-   * @return 停顿音频数据
    */
-  std::vector<float> GeneratePause(
-      float duration,
-      int sampling_rate);
+  std::vector<float> GeneratePause(float duration, int sampling_rate);
+
+  /**
+   * @brief 采样top-k token
+   */
+  static int64_t SampleTopK(
+      const Model::Tensor* topk_values,
+      const Model::Tensor* topk_indices,
+      float temperature);
 };
 
 }  // namespace GPTSoVITS

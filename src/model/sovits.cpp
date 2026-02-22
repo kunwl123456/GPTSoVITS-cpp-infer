@@ -3,6 +3,13 @@
 //
 
 #include "GPTSoVITS/model/sovits.h"
+
+#ifdef WITH_CUDA
+#include <cuda_runtime_api.h>
+#include <driver_types.h>
+#endif
+
+
 #include "GPTSoVITS/plog.h"
 
 namespace GPTSoVITS::Model {
@@ -90,6 +97,17 @@ std::unique_ptr<Tensor> SoVITSModel::GenerateTensor(Tensor* pred_semantic,
   // Run inference
   std::unordered_map<std::string, std::unique_ptr<Tensor>> outputs;
   m_model->Forward(inputs, outputs);
+
+#ifdef WITH_CUDA
+  // 确保所有 CUDA 操作完成后再返回
+  // 避免调用者访问数据时 CUDA 内核仍在执行导致访问违规
+  if (model_device.type == DeviceType::kCUDA) {
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      PrintError("[SoVITS] cudaDeviceSynchronize failed: {}", cudaGetErrorString(err));
+    }
+  }
+#endif
 
   // Extract audio output
   if (outputs.find("audio") != outputs.end()) {

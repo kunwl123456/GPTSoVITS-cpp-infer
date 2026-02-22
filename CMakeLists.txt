@@ -74,6 +74,7 @@ include(cmake/xtensor-blas.cmake)
 include(cmake/utfcpp.cmake)
 include(cmake/cld2-cmake.cmake)
 include(cmake/cppjieba.cmake)
+include(cmake/cpptrace.cmake)
 
 # open_jtalk+hts_engine
 
@@ -99,10 +100,12 @@ endif ()
 # ==============================================================================
 file(GLOB_RECURSE GPT_SOVITS_CPP_SOURCE
     "src/*.cpp"
+    "src/Core/*.cpp"
     "src/bert/*.cpp"
     "src/g2p/*.cpp"
     "src/text/*.cpp"
     "src/export/*.cpp"
+    "src/Utils/*.cpp"
 )
 
 # CUDA kernel files
@@ -278,6 +281,7 @@ target_link_libraries(gsv_lib PUBLIC
     cppmodule::cld2_cmake
     cppmodule::cppjieba
     cppmodule::samplerate
+    cppmodule::cpptrace
     openjtalk
     ${BACKEND_LIBS}
 )

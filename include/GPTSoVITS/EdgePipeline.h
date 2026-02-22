@@ -19,6 +19,10 @@
 #include "model/gpt_step.h"
 #include "model/sovits.h"
 
+namespace GPTSoVITS::Model {
+struct SampleConfig;
+}
+
 namespace GPTSoVITS {
 
 class _JsonImpl;
@@ -51,13 +55,11 @@ public:
    * @param gpt_step_model GPT 步进模型
    * @param sovits_model SoVITS 模型
    */
-  EdgePipeline(
-      const std::string& config,
-      const std::string& model_path,
-      const std::shared_ptr<G2P::G2PPipline>& g2p_pipline,
-      const std::shared_ptr<Model::GPTEncoderModel>& gpt_encoder_model,
-      const std::shared_ptr<Model::GPTStepModel>& gpt_step_model,
-      const std::shared_ptr<Model::SoVITSModel>& sovits_model);
+  EdgePipeline(const std::string& config, const std::string& model_path,
+               const std::shared_ptr<G2P::G2PPipline>& g2p_pipline,
+               const std::shared_ptr<Model::GPTEncoderModel>& gpt_encoder_model,
+               const std::shared_ptr<Model::GPTStepModel>& gpt_step_model,
+               const std::shared_ptr<Model::SoVITSModel>& sovits_model);
 
   virtual ~EdgePipeline() = default;
 
@@ -75,10 +77,12 @@ public:
    * @param speaker_name 说话人名称
    * @param text 目标文本
    * @param text_lang 文本语言
-   * @param temperature 温度参数
+   * @param temperature 温度参数（已弃用，使用 sample_config）
    * @param noise_scale 噪声缩放
    * @param speed 速度
    * @return 生成的音频
+   *
+   * @deprecated 请使用带 SampleConfig 参数的版本
    */
   std::unique_ptr<AudioTools> InferSpeaker(const std::string& speaker_name,
                                            const std::string& text,
@@ -86,6 +90,21 @@ public:
                                            float temperature = 1.0f,
                                            float noise_scale = 0.5f,
                                            float speed = 1.0f);
+
+  /**
+   * @brief 推理说话人（推荐版本，支持完整采样配置）
+   * @param speaker_name 说话人名称
+   * @param text 目标文本
+   * @param text_lang 文本语言
+   * @param sample_config 采样配置
+   * @param noise_scale 噪声缩放
+   * @param speed 速度
+   * @return 生成的音频
+   */
+  std::unique_ptr<AudioTools> InferSpeaker(
+      const std::string& speaker_name, const std::string& text,
+      const std::string& text_lang, const Model::SampleConfig& sample_config,
+      float noise_scale = 0.5f, float speed = 1.0f);
 
   /**
    * @brief 列出所有已导入的说话人
@@ -108,10 +127,71 @@ public:
   bool HasSpeaker(const std::string& speaker_name) const;
 
   /**
+   * @brief 获取说话人信息
+   * @param speaker_name 说话人名称
+   * @return 说话人信息指针（如果不存在则返回 nullptr）
+   */
+  const SpeakerInfo* GetSpeakerInfo(const std::string& speaker_name) const;
+
+  // ============ 流推理支持方法 ============
+
+  /**
+   * @brief 获取 GPT Encoder 模型
+   */
+  [[nodiscard]] std::shared_ptr<Model::GPTEncoderModel> GetGPTEncoderModel()
+      const {
+    return m_gpt_encoder_model;
+  }
+
+  /**
+   * @brief 获取 GPT Step 模型
+   */
+  [[nodiscard]] std::shared_ptr<Model::GPTStepModel> GetGPTStepModel() const {
+    return m_gpt_step_model;
+  }
+
+  /**
+   * @brief 获取 SoVITS 模型
+   */
+  [[nodiscard]] std::shared_ptr<Model::SoVITSModel> GetSoVITSModel() const {
+    return m_sovits_model;
+  }
+
+  /**
+   * @brief 获取 G2P Pipeline
+   */
+  [[nodiscard]] std::shared_ptr<G2P::G2PPipline> GetG2PPipeline() const {
+    return m_g2p_pipline;
+  }
+
+  /**
+   * @brief 获取采样率
+   */
+  [[nodiscard]] int GetSamplingRate() const { return m_sampling_rate; }
+
+  /**
+   * @brief 使用配置进行采样
+   */
+  int64_t SampleWithConfig(const Model::Tensor* topk_values,
+                           const Model::Tensor* topk_indices,
+                           const Model::SampleConfig& config) const;
+
+  /**
    * @brief 获取模型信息
    * @return 模型信息字符串
    */
   std::string GetModelInfo() const;
+
+  static std::unique_ptr<Model::Tensor> ConcatTensor(const Model::Tensor* a,
+                                                     const Model::Tensor* b,
+                                                     int axis);
+  // Helper methods
+  static int64_t SampleTopK(const Model::Tensor* topk_values,
+                            const Model::Tensor* topk_indices,
+                            float temperature);
+
+  static int64_t SampleTopKWithConfig(const Model::Tensor* logits,
+                                      const Model::SampleConfig& config);
 
 private:
   std::shared_ptr<_JsonImpl> m_config;
@@ -129,14 +209,6 @@ private:
   int m_mel_bins = 128;
   int m_sv_dim = 20480;
   std::string m_model_version = "v2";
-
-  // Helper methods
-  static int64_t SampleTopK(const Model::Tensor* topk_values,
-                            const Model::Tensor* topk_indices,
-                            float temperature);
-  static std::unique_ptr<Model::Tensor> ConcatTensor(const Model::Tensor* a,
-                                                     const Model::Tensor* b,
-                                                     int axis);
 
   // 初始化配置参数
   void InitializeConfig();

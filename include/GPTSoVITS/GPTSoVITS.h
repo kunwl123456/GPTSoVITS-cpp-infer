@@ -24,6 +24,7 @@
 #include "GPTSoVITS/model/gpt_encoder.h"
 #include "GPTSoVITS/model/gpt_step.h"
 #include "GPTSoVITS/model/sovits.h"
+#include "GPTSoVITS/model/sample_config.h"
 #include "GPTSoVITS/G2P/Base.h"
 #include "GPTSoVITS/G2P/G2P_EN.h"
 #include "GPTSoVITS/G2P/G2P_Zh.h"
