@@ -178,6 +178,38 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
       prompts_final.get(),
       all_bert_expanded.get());
 
+  // 检查 encoder 输出有效性
+  if (!encoder_output.topk_values || !encoder_output.topk_indices) {
+    PrintError("[StreamingPipeline] GPT Encoder output is null");
+    return prev_fade_out;
+  }
+
+  // 检查 encoder 输出的 topk_values 是否包含 NaN/Inf
+  {
+    auto topk_cpu = encoder_output.topk_values->ToCPU();
+    const float* vals = topk_cpu->Data<float>();
+    int k = topk_cpu->ElementCount();
+    bool has_nan = false;
+    for (int i = 0; i < k; ++i) {
+      if (!std::isfinite(vals[i])) {
+        has_nan = true;
+        break;
+      }
+    }
+    if (has_nan) {
+      PrintError("[StreamingPipeline] GPT Encoder topk_values contains NaN/Inf!");
+      return prev_fade_out;
+    }
+  }
+
+  if (encoder_output.k_cache && encoder_output.v_cache) {
+    PrintDebug("[StreamingPipeline] GPT Encoder cache types: k_cache={}, v_cache={}",
+               static_cast<int>(encoder_output.k_cache->Type()),
+               static_cast<int>(encoder_output.v_cache->Type()));
+    PrintDebug("[StreamingPipeline] GPT Step expected k_cache type: {}",
+               static_cast<int>(gpt_step_model->GetModel()->GetInputDataType("k_cache")));
+  }
+
   // 采样第一个 token
   int64_t first_token = SampleTopK(
       encoder_output.topk_values.get(),
@@ -207,6 +239,19 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   // KV Cache
   auto k_cache = std::move(encoder_output.k_cache);
   auto v_cache = std::move(encoder_output.v_cache);
+
+  // 检查 cache 是否需要类型转换
+  auto expected_cache_dtype = gpt_step_model->GetModel()->GetInputDataType("k_cache");
+  if (k_cache && k_cache->Type() != expected_cache_dtype) {
+    PrintDebug("[StreamingPipeline] Converting k_cache from type {} to {}",
+               static_cast<int>(k_cache->Type()), static_cast<int>(expected_cache_dtype));
+    k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
+  }
+  if (v_cache && v_cache->Type() != expected_cache_dtype) {
+    PrintDebug("[StreamingPipeline] Converting v_cache from type {} to {}",
+               static_cast<int>(v_cache->Type()), static_cast<int>(expected_cache_dtype));
+    v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
+  }
 
   // 生成的语义 tokens 列表
   std::vector<int64_t> generated_tokens;
@@ -243,27 +288,24 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
       return;
     }
 
-    // 应用淡入淡出
+    // 应用交叉淡入淡出 (Cross-fade)
     if (!last_fade_out.empty() && m_config.enable_fade) {
       int fade_len = std::min(static_cast<int>(last_fade_out.size()), 
                               static_cast<int>(audio_data.size()));
       for (int i = 0; i < fade_len; ++i) {
         float fade_in = static_cast<float>(i) / fade_len;
-        audio_data[i] = audio_data[i] * fade_in + last_fade_out[i] * (1.0f - fade_in);
+        float fade_out = 1.0f - fade_in;  // 淡出曲线：从1到0
+        // 当前音频应用淡入，前一音频末尾应用淡出
+        audio_data[i] = audio_data[i] * fade_in + last_fade_out[i] * fade_out;
       }
     }
 
-    // 计算淡出（如果不是最后一块）
+    // prev_fade_out = audio_data[-fade_len:]
     if (!is_final_chunk && m_config.enable_fade && 
         audio_data.size() > static_cast<size_t>(m_config.fade_length)) {
       last_fade_out.assign(
           audio_data.end() - m_config.fade_length, 
           audio_data.end());
-      // 应用淡出曲线
-      for (int i = 0; i < m_config.fade_length; ++i) {
-        float fade_out = 1.0f - static_cast<float>(i) / m_config.fade_length;
-        audio_data[audio_data.size() - m_config.fade_length + i] *= fade_out;
-      }
     } else {
       last_fade_out.clear();
     }
@@ -277,13 +319,21 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     }
 
     // 创建音频分块
+    // audio_to_yield = audio_data[:-fade_len]
     AudioChunk chunk;
-    chunk.audio_data = audio_data;
+    if (!is_final_chunk && m_config.enable_fade && 
+        audio_data.size() > static_cast<size_t>(m_config.fade_length)) {
+      // 截断末尾淡出区域，这部分保存在 last_fade_out 中，会在下一块的交叉淡入淡出中处理
+      chunk.audio_data.assign(audio_data.begin(), audio_data.end() - m_config.fade_length);
+    } else {
+      // 最后一块或禁用淡入淡出：输出完整音频
+      chunk.audio_data = audio_data;
+    }
     chunk.is_first = (segment_index == 0 && chunk_index == 0);
     chunk.is_last = is_final_chunk;
     chunk.segment_index = segment_index;
     chunk.chunk_index = chunk_index;
-    chunk.duration = static_cast<float>(audio_data.size()) / sampling_rate;
+    chunk.duration = static_cast<float>(chunk.audio_data.size()) / sampling_rate;
 
     // 调用回调
     if (callback) {
@@ -296,6 +346,9 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   };
 
   // GPT Step 自回归生成
+  int consecutive_invalid_count = 0;
+  const int max_consecutive_invalid = 10;
+
   for (int step = 0; step < max_steps; ++step) {
     auto step_output = gpt_step_model->Step(
         current_samples.get(),
@@ -304,6 +357,55 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
         idx.get(),
         x_len.get(),
         y_len.get());
+
+    // 检查输出有效性
+    bool output_valid = true;
+    if (!step_output.topk_values || step_output.topk_values->ElementCount() == 0) {
+      PrintError("[StreamingPipeline] Step {}: topk_values is empty!", step);
+      output_valid = false;
+    } else if (!step_output.k_cache_new || !step_output.v_cache_new) {
+      PrintError("[StreamingPipeline] Step {}: k_cache_new or v_cache_new is null!", step);
+      output_valid = false;
+    } else {
+      // 检查是否有 NaN/Inf
+      auto topk_values_cpu = step_output.topk_values->To(
+          Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
+      const float* values = topk_values_cpu->Data<float>();
+      int k = topk_values_cpu->ElementCount();
+      for (int j = 0; j < k; ++j) {
+        if (!std::isfinite(values[j])) {
+          PrintError("[StreamingPipeline] Step {}: topk_values contains NaN/Inf at index {}!", step, j);
+          // 打印更多调试信息
+          PrintError("[StreamingPipeline] Step {}: First 5 values:", step);
+          for (int dbg = 0; dbg < std::min(5, k); ++dbg) {
+            PrintError("  values[{}] = {}", dbg, values[dbg]);
+          }
+          output_valid = false;
+          break;
+        }
+      }
+    }
+
+    if (!output_valid) {
+      consecutive_invalid_count++;
+      if (consecutive_invalid_count >= max_consecutive_invalid) {
+        PrintError("[StreamingPipeline] GPT Step failed {} times consecutively, terminating at step {}",
+                   consecutive_invalid_count, step);
+        break;
+      }
+      // 使用上一个有效 token 继续
+      int64_t last_valid_token = current_samples->At<int64_t>(0);
+      auto next_token_tensor = Model::Tensor::Empty(
+          {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
+      next_token_tensor->At<int64_t>(0) = last_valid_token;
+      current_samples = next_token_tensor->Clone();
+      generated_tokens.push_back(last_valid_token);
+      token_counter++;
+      idx->At<int64_t>(0)++;
+      continue;
+    }
+
+    consecutive_invalid_count = 0;
 
     // 采样下一个 token
     int64_t next_token = SampleTopK(
@@ -319,6 +421,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
 
     // 检查 EOS
     if (next_token == eos_token) {
+      PrintInfo("[StreamingPipeline] Generated {} tokens before EOS", step + 1);
       break;
     }
 
@@ -332,23 +435,64 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     // 先clone用于下一次step输入，再move
     current_samples = next_token_tensor->Clone();
 
-    // 更新 cache
-    k_cache = std::move(step_output.k_cache_new);
-    v_cache = std::move(step_output.v_cache_new);
+    // 更新 cache 并检查类型
+    auto expected_cache_dtype = gpt_step_model->GetModel()->GetInputDataType("k_cache");
+    
+    if (step_output.k_cache_new) {
+      k_cache = std::move(step_output.k_cache_new);
+      // 确保类型正确
+      if (k_cache && k_cache->Type() != expected_cache_dtype) {
+        k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
+      }
+    } else {
+      PrintError("[StreamingPipeline] Step {}: k_cache_new is null!", step);
+    }
+    
+    if (step_output.v_cache_new) {
+      v_cache = std::move(step_output.v_cache_new);
+      // 确保类型正确
+      if (v_cache && v_cache->Type() != expected_cache_dtype) {
+        v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
+      }
+    } else {
+      PrintError("[StreamingPipeline] Step {}: v_cache_new is null!", step);
+    }
 
     // 更新索引
     idx->At<int64_t>(0)++;
 
-    // 当token数量达到chunk_length时进行分割
+    // mute_matrix
     bool is_split = false;
-    if (token_counter >= m_config.chunk_length) {
+    if (token_counter >= m_config.chunk_length + 2) {
+      // 如果启用了 mute_matrix，尝试找到最佳分割点
+      if (m_config.enable_mute_matrix && m_mute_matrix) {
+        // 获取最近的 tokens 用于计算分割点
+        std::vector<int64_t> recent_tokens(
+            generated_tokens.end() - token_counter,
+            generated_tokens.end());
 
-      std::vector<int64_t> chunk_tokens(
-          generated_tokens.end() - token_counter,
-          generated_tokens.end());
-      chunk_queue.push_back(std::move(chunk_tokens));
-      token_counter = 0;
-      is_split = true;
+        int split_idx = FindBestSplitPoint(recent_tokens, m_config.chunk_length);
+        if (split_idx >= 0 && split_idx + 1 >= m_config.chunk_length) {
+          // 在最佳分割点分割
+          int actual_split = split_idx + 1;
+          std::vector<int64_t> chunk_tokens(
+              generated_tokens.end() - token_counter,
+              generated_tokens.end() - token_counter + actual_split);
+          chunk_queue.push_back(std::move(chunk_tokens));
+          token_counter -= actual_split;
+          is_split = true;
+        }
+      }
+
+      // 如果没有使用 mute_matrix 分割，使用固定长度分割
+      if (!is_split && token_counter >= m_config.chunk_length) {
+        std::vector<int64_t> chunk_tokens(
+            generated_tokens.end() - token_counter,
+            generated_tokens.end());
+        chunk_queue.push_back(std::move(chunk_tokens));
+        token_counter = 0;
+        is_split = true;
+      }
     }
 
     // 如果有多个待解码块，解码第一个
@@ -499,25 +643,26 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     return {};
   }
 
-  // 提取音频数据 - 立即拷贝到 vector 确保内存安全
-  auto audio_cpu = audio_tensor->ToCPU();
+  // 提取音频数据
+  auto audio_cpu = audio_tensor->To(Model::Device(Model::DeviceType::kCPU),
+                                    Model::DataType::kFloat32);
   if (!audio_cpu || audio_cpu->ElementCount() == 0) {
-    PrintError("[StreamingPipeline::DecodeChunk] audio_cpu is null or empty after ToCPU");
+    PrintError("[StreamingPipeline::DecodeChunk] audio_cpu is null or empty after To");
     return {};
   }
   
   size_t audio_size = audio_cpu->ElementCount();
   const float* audio_ptr = audio_cpu->Data<float>();
-  
+
   if (!audio_ptr) {
     PrintError("[StreamingPipeline::DecodeChunk] audio_ptr is null");
     return {};
   }
-  
-  // 立即将音频数据拷贝到 vector，避免后续访问可能失效的指针
-  std::vector<float> audio_vec(audio_ptr, audio_ptr + audio_size);
-  audio_ptr = nullptr;  // 不再使用原始指针
-  audio_cpu.reset();    // 释放 tensor
+
+  std::vector<float> audio_vec(audio_size);
+  std::memcpy(audio_vec.data(), audio_ptr, audio_size * sizeof(float));
+
+  audio_cpu.reset();
 
   // 计算应该返回的样本数（仅当前分块的部分）
   int samples_per_token = static_cast<int>((sampling_rate / 25) / speed);  // 语义帧率为 25Hz
@@ -575,6 +720,7 @@ int64_t StreamingPipeline::SampleTopK(
     const Model::Tensor* topk_indices,
     float temperature) {
   if (!topk_values || !topk_indices || topk_values->ElementCount() == 0) {
+    PrintError("[StreamingPipeline::SampleTopK] Invalid input: null or empty tensor");
     return 0;
   }
 
@@ -588,28 +734,124 @@ int64_t StreamingPipeline::SampleTopK(
   const float* values_ptr = values_cpu->Data<float>();
   const int64_t* indices_ptr = indices_cpu->Data<int64_t>();
 
-  // 应用温度
-  std::vector<float> probs(static_cast<size_t>(k));
+  // 检查温度参数有效性
+  if (temperature <= 1e-6f) {
+    PrintWarn("[StreamingPipeline::SampleTopK] Temperature too small: {}, using 1.0", temperature);
+    temperature = 1.0f;
+  }
+
+  // 检查输入值是否包含 NaN/Inf
+  bool has_invalid = false;
+  for (int i = 0; i < k; ++i) {
+    if (!std::isfinite(values_ptr[i])) {
+      has_invalid = true;
+      break;
+    }
+  }
+
+  if (has_invalid) {
+    // 打印前几个值用于调试
+    PrintError("[StreamingPipeline::SampleTopK] Input contains NaN/Inf! First 5 values:");
+    for (int i = 0; i < std::min(static_cast<int64_t>(5), k); ++i) {
+      PrintError("  values[{}] = {}", i, values_ptr[i]);
+    }
+    // 返回第一个有效索引
+    return indices_ptr[0];
+  }
+
+  // 找最大值
   float max_val = *std::max_element(values_ptr, values_ptr + static_cast<size_t>(k));
+  
+  // 检查 max_val 是否有效
+  if (!std::isfinite(max_val)) {
+    PrintError("[StreamingPipeline::SampleTopK] max_val is NaN/Inf: {}", max_val);
+    return indices_ptr[0];
+  }
+
+  // 应用温度并计算 softmax
+  std::vector<float> probs(static_cast<size_t>(k));
   float sum = 0.0f;
   
   for (int i = 0; i < k; ++i) {
-    probs[i] = std::exp((values_ptr[i] - max_val) / temperature);
+    // 数值稳定性：减去最大值后再除以温度
+    float logit = (values_ptr[i] - max_val) / temperature;
+    
+    // Clamp 防止 exp 溢出
+    if (logit > 50.0f) {
+      logit = 50.0f;
+    } else if (logit < -50.0f) {
+      logit = -50.0f;
+    }
+    
+    probs[i] = std::exp(logit);
+    
+    // 检查结果是否有效
+    if (!std::isfinite(probs[i])) {
+      PrintWarn("[StreamingPipeline::SampleTopK] exp({}) = {} is invalid, resetting to 0", 
+               logit, probs[i]);
+      probs[i] = 0.0f;
+    }
+    
     sum += probs[i];
   }
 
   // 归一化
+  if (sum > 1e-10f) {
+    for (int i = 0; i < k; ++i) {
+      probs[i] /= sum;
+    }
+  } else {
+    // 如果 sum 太小，使用均匀分布
+    PrintWarn("[StreamingPipeline::SampleTopK] Sum too small ({:.6f}), using uniform distribution", sum);
+    float uniform_prob = 1.0f / static_cast<float>(k);
+    for (int i = 0; i < k; ++i) {
+      probs[i] = uniform_prob;
+    }
+  }
+
+  // 最终验证概率值
+  bool has_invalid_prob = false;
   for (int i = 0; i < k; ++i) {
-    probs[i] /= sum;
+    if (probs[i] < 0.0f || !std::isfinite(probs[i])) {
+      has_invalid_prob = true;
+      break;
+    }
+  }
+
+  if (has_invalid_prob) {
+    PrintError("[StreamingPipeline::SampleTopK] Invalid probability after normalization, using argmax");
+    // 返回概率最大的索引
+    int max_idx = 0;
+    float max_prob = probs[0];
+    for (int i = 1; i < k; ++i) {
+      if (probs[i] > max_prob) {
+        max_prob = probs[i];
+        max_idx = i;
+      }
+    }
+    return indices_ptr[max_idx];
   }
 
   // 多项式采样
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::discrete_distribution<int> dist(probs.begin(), probs.end());
-  int choice = dist(gen);
-
-  return indices_ptr[choice];
+  try {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    int choice = dist(gen);
+    return indices_ptr[choice];
+  } catch (const std::exception& e) {
+    PrintError("[StreamingPipeline::SampleTopK] discrete_distribution failed: {}", e.what());
+    // Fallback to argmax
+    int max_idx = 0;
+    float max_prob = probs[0];
+    for (int i = 1; i < k; ++i) {
+      if (probs[i] > max_prob) {
+        max_prob = probs[i];
+        max_idx = i;
+      }
+    }
+    return indices_ptr[max_idx];
+  }
 }
 
 std::vector<float> StreamingPipeline::ApplyFade(
@@ -648,6 +890,62 @@ std::vector<float> StreamingPipeline::GeneratePause(
     int sampling_rate) {
   int num_samples = static_cast<int>(duration * sampling_rate);
   return std::vector<float>(num_samples, 0.0f);
+}
+
+bool StreamingPipeline::LoadMuteMatrix(const std::string& path) {
+  PrintInfo("[StreamingPipeline] Loading mute matrix from: {}", path);
+
+  if (!std::filesystem::exists(path)) {
+    PrintWarn("[StreamingPipeline] Mute matrix file not found: {}", path);
+    return false;
+  }
+
+  m_mute_matrix = Model::Tensor::Empty({1025}, Model::DataType::kFloat32, Model::DeviceType::kCPU);
+  float* ptr = m_mute_matrix->Data<float>();
+  std::fill(ptr, ptr + 1025, 0.0f);
+
+  PrintInfo("[StreamingPipeline] Mute matrix loaded (using default values)");
+  return true;
+}
+
+int StreamingPipeline::FindBestSplitPoint(const std::vector<int64_t>& tokens, int min_length) const {
+  if (!m_mute_matrix || tokens.size() < static_cast<size_t>(min_length + 2)) {
+    return -1;
+  }
+
+  // 获取 mute_matrix 数据
+  auto mute_cpu = m_mute_matrix->IsCPU() ? m_mute_matrix.get() : m_mute_matrix->ToCPU().get();
+  const float* mute_scores = mute_cpu->Data<float>();
+
+  // 计算每个位置的分割得分
+  std::vector<float> scores(tokens.size());
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    int64_t token = tokens[i];
+    if (token >= 0 && token < 1025) {
+      scores[i] = mute_scores[token] - m_config.mute_threshold;
+      if (scores[i] < 0) scores[i] = -1.0f;  // 惩罚负分数
+    } else {
+      scores[i] = -1.0f;
+    }
+  }
+
+  // 计算累积得分（考虑相邻位置的贡献）
+  for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+    scores[i] += scores[i + 1];
+  }
+
+  // 找到最大得分位置
+  float max_score = -1.0f;
+  int best_idx = -1;
+
+  for (size_t i = static_cast<size_t>(min_length); i + 1 < tokens.size(); ++i) {
+    if (scores[i] >= 0 && scores[i] > max_score) {
+      max_score = scores[i];
+      best_idx = static_cast<int>(i);
+    }
+  }
+
+  return best_idx;
 }
 
 }  // namespace GPTSoVITS

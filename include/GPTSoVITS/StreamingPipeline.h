@@ -1,7 +1,3 @@
-//
-// Created by iFlow CLI on 2026/2/20.
-//
-
 #ifndef GPT_SOVITS_CPP_STREAMING_PIPELINE_H
 #define GPT_SOVITS_CPP_STREAMING_PIPELINE_H
 
@@ -28,6 +24,8 @@ struct StreamingConfig {
   int l_len = 16;                 // 前瞻token长度（用于平滑过渡）
   bool enable_fade = true;        // 是否启用淡入淡出
   bool enable_mute_matrix = false; // 是否使用静音矩阵分割
+  float mute_threshold = 0.3f;    // 静音矩阵分割阈值
+  std::string mute_matrix_path;   // 静音矩阵文件路径（可选）
 };
 
 /**
@@ -97,9 +95,22 @@ public:
    */
   const StreamingConfig& GetConfig() const { return m_config; }
 
+  /**
+   * @brief 加载静音矩阵（用于智能分割）
+   * @param path 静音矩阵文件路径
+   * @return 是否成功
+   */
+  bool LoadMuteMatrix(const std::string& path);
+
+  /**
+   * @brief 检查是否已加载静音矩阵
+   */
+  bool HasMuteMatrix() const { return m_mute_matrix != nullptr; }
+
 private:
   std::shared_ptr<EdgePipeline> m_edge_pipeline;
   StreamingConfig m_config;
+  std::unique_ptr<Model::Tensor> m_mute_matrix;  // 静音矩阵 (1025,)
 
   /**
    * @brief 流式处理单个文本段落
@@ -115,6 +126,14 @@ private:
       float noise_scale,
       float speed,
       const std::vector<float>& prev_fade_out);
+
+  /**
+   * @brief 使用静音矩阵查找最佳分割点
+   * @param tokens 生成的tokens
+   * @param min_length 最小分割长度
+   * @return 分割点索引，如果没有找到返回 -1
+   */
+  int FindBestSplitPoint(const std::vector<int64_t>& tokens, int min_length) const;
 
   /**
    * @brief 解码音频分块
