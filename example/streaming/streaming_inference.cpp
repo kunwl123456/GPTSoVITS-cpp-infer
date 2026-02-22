@@ -163,7 +163,7 @@ int main(int argc, char* argv[]) {
     std::string speaker_name = "firefly";
     std::string output_path = "streaming_output.wav";
     float temperature = 1.0f;
-    int top_k = 15;
+    int top_k = 40;
     float top_p = 0.6f;
     float noise_scale = 0.5f;
     float speed = 1.0f;

@@ -184,24 +184,6 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     return prev_fade_out;
   }
 
-  // 检查 encoder 输出的 topk_values 是否包含 NaN/Inf
-  {
-    auto topk_cpu = encoder_output.topk_values->ToCPU();
-    const float* vals = topk_cpu->Data<float>();
-    int k = topk_cpu->ElementCount();
-    bool has_nan = false;
-    for (int i = 0; i < k; ++i) {
-      if (!std::isfinite(vals[i])) {
-        has_nan = true;
-        break;
-      }
-    }
-    if (has_nan) {
-      PrintError("[StreamingPipeline] GPT Encoder topk_values contains NaN/Inf!");
-      return prev_fade_out;
-    }
-  }
-
   if (encoder_output.k_cache && encoder_output.v_cache) {
     PrintDebug("[StreamingPipeline] GPT Encoder cache types: k_cache={}, v_cache={}",
                static_cast<int>(encoder_output.k_cache->Type()),
@@ -366,24 +348,6 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     } else if (!step_output.k_cache_new || !step_output.v_cache_new) {
       PrintError("[StreamingPipeline] Step {}: k_cache_new or v_cache_new is null!", step);
       output_valid = false;
-    } else {
-      // 检查是否有 NaN/Inf
-      auto topk_values_cpu = step_output.topk_values->To(
-          Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
-      const float* values = topk_values_cpu->Data<float>();
-      int k = topk_values_cpu->ElementCount();
-      for (int j = 0; j < k; ++j) {
-        if (!std::isfinite(values[j])) {
-          PrintError("[StreamingPipeline] Step {}: topk_values contains NaN/Inf at index {}!", step, j);
-          // 打印更多调试信息
-          PrintError("[StreamingPipeline] Step {}: First 5 values:", step);
-          for (int dbg = 0; dbg < std::min(5, k); ++dbg) {
-            PrintError("  values[{}] = {}", dbg, values[dbg]);
-          }
-          output_valid = false;
-          break;
-        }
-      }
     }
 
     if (!output_valid) {
@@ -693,7 +657,7 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     size_t return_size = std::min(audio_size, static_cast<size_t>(chunk_samples));
     result.assign(audio_vec.begin(), audio_vec.begin() + return_size);
   } else {
-    // 正常情况：提取 h_samples 到 h_samples + chunk_samples 的部分
+    // 提取 h_samples 到 h_samples + chunk_samples 的部分
     size_t available = audio_size - h_samples;
     size_t return_size = std::min(static_cast<size_t>(chunk_samples), available);
     
@@ -724,9 +688,16 @@ int64_t StreamingPipeline::SampleTopK(
     return 0;
   }
 
-  // 确保数据在CPU上
-  auto values_cpu = topk_values->IsCPU() ? 
-      topk_values->Clone() : topk_values->ToCPU();
+  std::unique_ptr<Model::Tensor> values_cpu;
+  if (topk_values->Type() == Model::DataType::kFloat32) {
+    values_cpu = topk_values->IsCPU() ? topk_values->Clone() : topk_values->ToCPU();
+  } else {
+    // 非 float32 类型需要先转 CPU 再转 float32
+    values_cpu = topk_values->IsCPU() 
+        ? topk_values->ToType(Model::DataType::kFloat32)
+        : topk_values->ToCPU()->ToType(Model::DataType::kFloat32);
+  }
+
   auto indices_cpu = topk_indices->IsCPU() ? 
       topk_indices->Clone() : topk_indices->ToCPU();
 
@@ -740,56 +711,33 @@ int64_t StreamingPipeline::SampleTopK(
     temperature = 1.0f;
   }
 
-  // 检查输入值是否包含 NaN/Inf
-  bool has_invalid = false;
-  for (int i = 0; i < k; ++i) {
-    if (!std::isfinite(values_ptr[i])) {
-      has_invalid = true;
-      break;
-    }
-  }
-
-  if (has_invalid) {
-    // 打印前几个值用于调试
-    PrintError("[StreamingPipeline::SampleTopK] Input contains NaN/Inf! First 5 values:");
-    for (int i = 0; i < std::min(static_cast<int64_t>(5), k); ++i) {
-      PrintError("  values[{}] = {}", i, values_ptr[i]);
-    }
-    // 返回第一个有效索引
-    return indices_ptr[0];
-  }
-
-  // 找最大值
-  float max_val = *std::max_element(values_ptr, values_ptr + static_cast<size_t>(k));
+  // 参考 Python 的 softmax 实现
+  // 先减最大值，再 exp
+  // topk_values = topk_values - np.max(topk_values, axis=-1, keepdims=True)
+  //         probs = np.exp(topk_values)
   
-  // 检查 max_val 是否有效
-  if (!std::isfinite(max_val)) {
-    PrintError("[StreamingPipeline::SampleTopK] max_val is NaN/Inf: {}", max_val);
-    return indices_ptr[0];
+  // 找最大值（用于数值稳定性）
+  float max_val = values_ptr[0];
+  for (int i = 1; i < k; ++i) {
+    if (values_ptr[i] > max_val) max_val = values_ptr[i];
   }
 
-  // 应用温度并计算 softmax
+  // 应用温度并计算 softmax，参考 Python 实现
   std::vector<float> probs(static_cast<size_t>(k));
   float sum = 0.0f;
   
   for (int i = 0; i < k; ++i) {
-    // 数值稳定性：减去最大值后再除以温度
     float logit = (values_ptr[i] - max_val) / temperature;
     
-    // Clamp 防止 exp 溢出
-    if (logit > 50.0f) {
-      logit = 50.0f;
-    } else if (logit < -50.0f) {
-      logit = -50.0f;
-    }
-    
-    probs[i] = std::exp(logit);
-    
-    // 检查结果是否有效
-    if (!std::isfinite(probs[i])) {
-      PrintWarn("[StreamingPipeline::SampleTopK] exp({}) = {} is invalid, resetting to 0", 
-               logit, probs[i]);
+    // 防止 exp 溢出
+    // 当 logit < -88 时 exp 结果为 0，logit > 88 时可能溢出
+    if (logit < -88.0f) {
       probs[i] = 0.0f;
+    } else if (logit > 88.0f) {
+      // 溢出时截断
+      probs[i] = std::exp(88.0f);  // ~1.65e38，在 float32 范围内
+    } else {
+      probs[i] = std::exp(logit);
     }
     
     sum += probs[i];
@@ -801,35 +749,11 @@ int64_t StreamingPipeline::SampleTopK(
       probs[i] /= sum;
     }
   } else {
-    // 如果 sum 太小，使用均匀分布
-    PrintWarn("[StreamingPipeline::SampleTopK] Sum too small ({:.6f}), using uniform distribution", sum);
+    // 所有概率都接近0时，使用均匀分布（fallback）
     float uniform_prob = 1.0f / static_cast<float>(k);
     for (int i = 0; i < k; ++i) {
       probs[i] = uniform_prob;
     }
-  }
-
-  // 最终验证概率值
-  bool has_invalid_prob = false;
-  for (int i = 0; i < k; ++i) {
-    if (probs[i] < 0.0f || !std::isfinite(probs[i])) {
-      has_invalid_prob = true;
-      break;
-    }
-  }
-
-  if (has_invalid_prob) {
-    PrintError("[StreamingPipeline::SampleTopK] Invalid probability after normalization, using argmax");
-    // 返回概率最大的索引
-    int max_idx = 0;
-    float max_prob = probs[0];
-    for (int i = 1; i < k; ++i) {
-      if (probs[i] > max_prob) {
-        max_prob = probs[i];
-        max_idx = i;
-      }
-    }
-    return indices_ptr[max_idx];
   }
 
   // 多项式采样
