@@ -136,7 +136,7 @@ void PrintUsage(const char* program_name) {
             << std::endl;
   std::cout << "  --top-p <float>           Top-P 采样参数 (默认: 0.6)"
             << std::endl;
-  std::cout << "  --noise-scale <float>     噪声缩放 (默认: 0.5)" << std::endl;
+  std::cout << "  --noise-scale <float>     噪声缩放 (默认: 0.35，与Python一致)" << std::endl;
   std::cout << "  --speed <float>           语速 (默认: 1.0)" << std::endl;
   std::cout << "  --chunk-length <int>      分块长度，token数 (默认: 24)"
             << std::endl;
