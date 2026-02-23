@@ -214,13 +214,25 @@ void StableSoftmax(
   }
   
   // 计算 exp((x - max) / temperature)
-  // Python: topk_values = topk_values - np.max(topk_values)
-  //         probs = np.exp(topk_values)
+  //  topk_values = topk_values - np.max(topk_values)
+  //  probs = np.exp(topk_values)
   float sum = 0.0f;
   for (size_t i = 0; i < size; ++i) {
-    float logit = (logits[i] - max_val) / temperature;
-    // 防止 underflow: exp(-88) ~ 1e-38，已经很小
-    probs[i] = (logit < -88.0f) ? 0.0f : std::exp(logit);
+    float logit = logits[i] - max_val;  // 先减去最大值
+    if (temperature != 1.0f && temperature > 1e-6f) {
+      logit /= temperature;  // 只有当 temperature != 1.0 时才除以温度
+    }
+    // Clamp 防止 exp 溢出/下溢
+    if (logit > 50.0f) {
+      logit = 50.0f;
+    } else if (logit < -50.0f) {
+      logit = -50.0f;
+    }
+    probs[i] = std::exp(logit);
+    // 检查 NaN/Inf
+    if (!std::isfinite(probs[i])) {
+      probs[i] = 0.0f;
+    }
     sum += probs[i];
   }
   
@@ -324,12 +336,25 @@ int64_t SampleTopK(
   }
   
   // 计算 exp((x - max) / temperature) 并求和
+  // Python: topk_values = topk_values - np.max(topk_values)
+  //         probs = np.exp(topk_values)
   float sum = 0.0f;
   for (int64_t i = 0; i < k; ++i) {
-    float logit = (values_ptr[i] - max_val) / temperature;
-    // 防止 exp 溢出，最大值减去 max_val 后为 0，所以 logit <= 0
-    // 只有很小的负值可能导致 underflow
-    probs[i] = (logit < std::numeric_limits<float>::min()) ? 0.0f : std::exp(logit);
+    float logit = values_ptr[i] - max_val;  // 先减去最大值
+    if (temperature != 1.0f && temperature > 1e-6f) {
+      logit /= temperature;  // 只有当 temperature != 1.0 时才除以温度
+    }
+    // Clamp 防止 exp 溢出/下溢
+    if (logit > 50.0f) {
+      logit = 50.0f;
+    } else if (logit < -50.0f) {
+      logit = -50.0f;
+    }
+    probs[i] = std::exp(logit);
+    // 检查 NaN/Inf
+    if (!std::isfinite(probs[i])) {
+      probs[i] = 0.0f;
+    }
     sum += probs[i];
   }
   

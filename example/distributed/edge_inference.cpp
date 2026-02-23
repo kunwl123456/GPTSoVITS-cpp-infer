@@ -20,6 +20,12 @@
 #define MODEL_PATH R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
 #endif
 
+#ifdef _HOST_WINDOWS__
+auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
+#else
+auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
+#endif
+
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
   std::system("chcp 65001");
@@ -32,7 +38,14 @@ int main(int argc, char* argv[]) {
 
     // 解析命令行参数
     std::string speaker_package = "firefly.gsppkg";
-    std::string text = "你好，这是一段测试文本，演示少量模型推理能力。";
+    std::string text = {
+      "皆さん、我在インターネット上看到someone把几国language混在一起speak。我看到之后be like：それは我じゃないか！私もtry一tryです。\n"
+      "虽然是混乱している句子ですけど、中文日本語プラスEnglish、挑戦スタート！\n"
+      "我study日本語的时候，もし有汉字，我会很happy。\n"
+      "Bueause中国人として、when I see汉字，すぐに那个汉字がわかります。\n"
+      "But 我hate外来語、什么マクドナルド、スターバックス、グーグル、ディズニーランド、根本记不住カタカナhow to写、太難しい。\n"
+      "2021年6月25日,今天32°C。以上です，byebye！"
+    };
     std::string text_lang = "zh";
     std::string speaker_name = "firefly";
     std::string output_path = "edge_output.wav";
@@ -52,8 +65,8 @@ int main(int argc, char* argv[]) {
     // 创建 Pipeline 配置（边缘模式）
     GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Edge(
         MODEL_PATH,
-        GPTSoVITS::Model::DeviceType::kCUDA,  // 或 kCPU
-        0);
+        device.type,
+        device.device_id);
     config.resources_path = "./res";
     config.verbose = true;
 

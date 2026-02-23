@@ -39,8 +39,7 @@ int main() {
       "我study日本語的时候，もし有汉字，我会很happy。\n"
       "Bueause中国人として、when I see汉字，すぐに那个汉字がわかります。\n"
       "But 我hate外来語、什么マクドナルド、スターバックス、グーグル、ディズニーランド、根本记不住カタカナhow to写、太難しい。\n"
-      "2021年6月25日,今天32°C。以上です，byebye！\n"
-      "我似乎会随긴긴시着时间的流逝,간이렇게보내다간말라죽을,最后枯萎거같아서死去"
+      "2021年6月25日,今天32°C。以上です，byebye！"
     };
 //    std::vector<std::string> test_strs = {
 ////      "This function is used to find the length (in code points) of a UTF-8 encoded string. The reason it is called distance, rather than, say, length is mainly because developers are used that length is an O(1) function. Computing the length of an UTF-8 string is a linear operation, and it looked better to model it after std::distance algorithm."

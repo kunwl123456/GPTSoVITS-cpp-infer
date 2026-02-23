@@ -44,21 +44,33 @@ std::unique_ptr<Tensor> SampleTopKCPU(
 
   // 对每个 batch 进行采样
   for (int b = 0; b < batch; ++b) {
-    // 应用温度
     float* batch_values = values_ptr + b * k;
     int64_t* batch_indices = indices_ptr + b * k;
 
-    if (temperature != 1.0f) {
-      float max_val = *std::max_element(batch_values, batch_values + k);
+    // 减去最大值 (数值稳定性，必须做)
+    float max_val = *std::max_element(batch_values, batch_values + k);
+    for (int i = 0; i < k; ++i) {
+      batch_values[i] = batch_values[i] - max_val;
+    }
+
+    // 应用温度 (只有 temperature != 1.0 时才除)
+    if (temperature != 1.0f && temperature > 1e-6f) {
       for (int i = 0; i < k; ++i) {
-        batch_values[i] = (batch_values[i] - max_val) / temperature;
+        batch_values[i] /= temperature;
       }
+    }
+
+    // Clamp 防止 exp 溢出/下溢
+    for (int i = 0; i < k; ++i) {
+      if (batch_values[i] > 50.0f) batch_values[i] = 50.0f;
+      else if (batch_values[i] < -50.0f) batch_values[i] = -50.0f;
     }
 
     // Softmax
     float sum = 0.0f;
     for (int i = 0; i < k; ++i) {
       batch_values[i] = std::exp(batch_values[i]);
+      if (!std::isfinite(batch_values[i])) batch_values[i] = 0.0f;
       sum += batch_values[i];
     }
 

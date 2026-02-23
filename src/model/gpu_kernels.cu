@@ -129,7 +129,12 @@ __global__ void SoftmaxKernel(float* __restrict__ logits,
     } else {
       logits[i] = logits[i] - max_val;
     }
+    // Clamp 防止 exp 溢出/下溢
+    if (logits[i] > 50.0f) logits[i] = 50.0f;
+    else if (logits[i] < -50.0f) logits[i] = -50.0f;
     logits[i] = expf(logits[i]);
+    // 检查 NaN/Inf
+    if (!isfinite(logits[i])) logits[i] = 0.0f;
     sum += logits[i];
   }
 
