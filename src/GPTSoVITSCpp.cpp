@@ -7,6 +7,7 @@
 #include <random>
 
 #include "GPTSoVITS/plog.h"
+#include "GPTSoVITS/Utils/LoudnessNormalizer.h"
 #include "GPTSoVITS/Utils/Precision.h"
 #include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/speaker_serializer.h"
@@ -601,29 +602,25 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     }
   }
 
-  // 全局峰值归一化
+  // RMS + Peak 组合归一化
   if (!final_audio.empty()) {
-    // 找到最大幅度
-    float max_amp = 0.0f;
-    for (const auto& sample : final_audio) {
-      float abs_sample = std::abs(sample);
-      if (abs_sample > max_amp) {
-        max_amp = abs_sample;
-      }
-    }
-
-    // 归一化到0.9倍峰值
-    if (max_amp > 1e-5f) {
-      float scale = 0.9f / max_amp;
-      for (auto& sample : final_audio) {
-        sample *= scale;
-      }
-    }
-
-    PrintDebug("Final audio: {} samples ({} seconds), peak amplitude: {:.4f}",
+    LoudnessConfig loudness_config;
+    loudness_config.target_rms = 0.18f;      // 目标 RMS (~-15dBFS)
+    loudness_config.max_gain = 10.0f;        // 最大增益
+    loudness_config.min_gain = 0.1f;         // 最小增益
+    loudness_config.enable_peak_limiting = true;
+    loudness_config.peak_threshold = 0.9f;   // 峰值限制阈值
+    
+    LoudnessNormalizer normalizer(loudness_config);
+    
+    float gain = normalizer.NormalizeCombined(final_audio);
+    float rms = normalizer.CalculateRMS(final_audio);
+    float peak = normalizer.CalculatePeak(final_audio);
+    
+    PrintDebug("Final audio: {} samples ({} seconds), gain: {:.4f}, RMS: {:.4f}, peak: {:.4f}",
               final_audio.size(),
               static_cast<float>(final_audio.size()) / m_config_params.sampling_rate,
-              max_amp);
+              gain, rms, peak);
 
     return AudioTools::FromByte(final_audio,m_config_params.sampling_rate);
   } else {

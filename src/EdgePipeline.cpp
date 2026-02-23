@@ -1,12 +1,9 @@
-//
-// Created by iFlow CLI on 2026/2/20.
-//
-
 #include "GPTSoVITS/EdgePipeline.h"
 
 #include <algorithm>
 #include <numeric>
 
+#include "GPTSoVITS/Utils/LoudnessNormalizer.h"
 #include "GPTSoVITS/Utils/Precision.h"
 #include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/speaker_serializer.h"
@@ -455,15 +452,21 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     audio_result.insert(audio_result.end(), audio_ptr, audio_ptr + audio_size);
   }
 
-  // 音频后处理：归一化
+  // RMS + Peak 组合归一化
   if (!audio_result.empty()) {
-    float max_amp = *std::max_element(audio_result.begin(), audio_result.end());
-    if (max_amp > 0.9f) {
-      float scale = 0.9f / max_amp;
-      for (auto& sample : audio_result) {
-        sample *= scale;
-      }
-    }
+    LoudnessConfig loudness_config;
+    loudness_config.target_rms = 0.18f;      // 目标 RMS (~-15dBFS)
+    loudness_config.max_gain = 10.0f;        // 最大增益
+    loudness_config.min_gain = 0.1f;         // 最小增益
+    loudness_config.enable_peak_limiting = true;
+    loudness_config.peak_threshold = 0.9f;   // 峰值限制阈值
+    
+    LoudnessNormalizer normalizer(loudness_config);
+    normalizer.NormalizeCombined(audio_result);
+    
+    PrintDebug("[EdgePipeline] Applied loudness normalization, RMS: {:.4f}, peak: {:.4f}",
+               normalizer.CalculateRMS(audio_result),
+               normalizer.CalculatePeak(audio_result));
   }
 
   // 创建 AudioTools 对象

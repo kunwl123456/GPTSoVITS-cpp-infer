@@ -9,6 +9,7 @@
 
 #include "GPTSoVITS/AudioTools.h"
 #include "GPTSoVITS/EdgePipeline.h"
+#include "GPTSoVITS/Utils/LoudnessNormalizer.h"
 #include "GPTSoVITS/model/tensor.h"
 
 namespace GPTSoVITS {
@@ -117,6 +118,7 @@ private:
   std::shared_ptr<EdgePipeline> m_edge_pipeline;
   StreamingConfig m_config;
   std::unique_ptr<Model::Tensor> m_mute_matrix;  // 静音矩阵 (1025,)
+  LoudnessNormalizer m_loudness_normalizer;      // 流式响度归一化器
 
   /**
    * @brief 流式处理单个文本段落

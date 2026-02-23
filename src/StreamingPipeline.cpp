@@ -11,6 +11,7 @@
 
 #include "GPTSoVITS/GPTSoVITSCpp.h"
 #include "GPTSoVITS/Text/Sentence.h"
+#include "GPTSoVITS/Utils/LoudnessNormalizer.h"
 #include "GPTSoVITS/Utils/Precision.h"
 #include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/TensorOps.h"
@@ -47,6 +48,9 @@ bool StreamingPipeline::InferSpeakerStreaming(
 
   PrintInfo("[StreamingPipeline] Starting streaming inference for speaker: {}, text: {}",
             speaker_name, text);
+
+  // 重置流式响度归一化器
+  m_loudness_normalizer.Reset();
 
   // 获取说话人信息
   const SpeakerInfo* speaker_info = m_edge_pipeline->GetSpeakerInfo(speaker_name);
@@ -337,6 +341,9 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     chunk.segment_index = segment_index;
     chunk.chunk_index = chunk_index;
     chunk.duration = static_cast<float>(chunk.audio_data.size()) / sampling_rate;
+    
+    // 应用流式响度归一化 (保持各块响度均匀)
+    m_loudness_normalizer.NormalizeStreaming(chunk.audio_data);
 
     // 调用回调
     if (callback) {

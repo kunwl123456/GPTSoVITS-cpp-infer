@@ -16,6 +16,7 @@
 #include "GPTSoVITS/G2P/G2P_Zh.h"
 #include "GPTSoVITS/G2P/Pipline.h"
 #include "GPTSoVITS/Text/Sentence.h"
+#include "GPTSoVITS/Utils/LoudnessNormalizer.h"
 #include "GPTSoVITS/Utils/Precision.h"
 #include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/speaker_serializer.h"
@@ -635,28 +636,25 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
   }
   
   // ================================================================
-  // Global Peak Normalization
-  // max_amp = np.abs(full_audio).max()
-  //         if max_amp > 1e-5: full_audio = full_audio / max_amp * 0.9
+  // RMS + Peak 组合归一化
+  // 先进行 RMS 归一化到目标响度，再进行峰值限制防止削波
   // ================================================================
   if (!final_audio.empty()) {
-    // 计算最大绝对值
-    float max_amp = 0.0f;
-    for (const auto& s : final_audio) {
-      float abs_val = std::abs(s);
-      if (abs_val > max_amp) max_amp = abs_val;
-    }
+    LoudnessConfig loudness_config;
+    loudness_config.target_rms = 0.18f;      // 目标 RMS (~-15dBFS)
+    loudness_config.max_gain = 10.0f;        // 最大增益
+    loudness_config.min_gain = 0.1f;         // 最小增益
+    loudness_config.enable_peak_limiting = true;
+    loudness_config.peak_threshold = 0.9f;   // 峰值限制阈值
     
-    PrintDebug("[InferencePipeline] Global max amplitude: {:.6f}", max_amp);
+    LoudnessNormalizer normalizer(loudness_config);
     
-    // 只有当 max_amp > 1e-5 时才进行归一化
-    if (max_amp > 1e-5f) {
-      float scale = 0.9f / max_amp;
-      for (auto& sample : final_audio) {
-        sample *= scale;
-      }
-      PrintDebug("[InferencePipeline] Applied global normalization, scale: {:.6f}", scale);
-    }
+    float gain = normalizer.NormalizeCombined(final_audio);
+    float rms = normalizer.CalculateRMS(final_audio);
+    float peak = normalizer.CalculatePeak(final_audio);
+    
+    PrintDebug("[InferencePipeline] Applied RMS normalization, gain: {:.4f}, "
+               "final RMS: {:.4f}, peak: {:.4f}", gain, rms, peak);
   }
   
   PrintInfo("[InferencePipeline] Generated audio: {} samples ({:.2f}s)", 
@@ -856,6 +854,15 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       "[InferencePipeline::InferStreaming] Starting streaming inference for "
       "speaker: {}, segments: {}",
       speaker_name, segments.size());
+  
+  // 创建流式响度归一化器
+  LoudnessConfig loudness_config;
+  loudness_config.target_rms = 0.18f;
+  loudness_config.smoothing_factor = 0.9f;
+  loudness_config.enable_peak_limiting = true;
+  loudness_config.peak_threshold = 0.9f;
+  LoudnessNormalizer loudness_normalizer(loudness_config);
+  
   // 预加载说话人特征到设备
   auto device = impl_->device_ctx->GetDevice();
   speaker->EnsureOnDevice(device);
@@ -1043,6 +1050,10 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       chunk.segment_index = segment_index;
       chunk.chunk_index = chunk_index;
       chunk.duration = static_cast<float>(audio_data.size()) / sampling_rate;
+      
+      // 应用流式响度归一化
+      loudness_normalizer.NormalizeStreaming(chunk.audio_data);
+      
       callback(chunk);
       chunk_index++;
     };
