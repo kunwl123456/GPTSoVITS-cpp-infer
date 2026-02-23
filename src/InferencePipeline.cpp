@@ -589,6 +589,24 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
     return nullptr;
   }
   
+  // len(current) + len(s) < 20 则合并
+  std::vector<std::string> merged_segments;
+  std::string current;
+  for (const auto& s : segments) {
+    if (current.size() + s.size() < 20) {
+      current += s;
+    } else {
+      if (!current.empty()) {
+        merged_segments.push_back(current);
+      }
+      current = s;
+    }
+  }
+  if (!current.empty()) {
+    merged_segments.push_back(current);
+  }
+  segments = std::move(merged_segments);
+  
   PrintInfo("[InferencePipeline] Processing {} segments", segments.size());
   
   // 预加载说话人特征到设备
@@ -815,6 +833,25 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
         "[InferencePipeline::InferStreaming] No text segments to process");
     return false;
   }
+
+  // 与 Python 对齐：短句合并逻辑 (len(current) + len(s) < 20 则合并)
+  std::vector<std::string> merged_segments;
+  std::string current;
+  for (const auto& s : segments) {
+    if (current.size() + s.size() < 20) {
+      current += s;
+    } else {
+      if (!current.empty()) {
+        merged_segments.push_back(current);
+      }
+      current = s;
+    }
+  }
+  if (!current.empty()) {
+    merged_segments.push_back(current);
+  }
+  segments = std::move(merged_segments);
+
   PrintInfo(
       "[InferencePipeline::InferStreaming] Starting streaming inference for "
       "speaker: {}, segments: {}",

@@ -158,7 +158,14 @@ int main(int argc, char* argv[]) {
 
     // 默认参数
     std::string speaker_package = "firefly.gsppkg";
-    std::string text = "你好，这是一段测试文本，用于演示流式推理功能。";
+    std::string text = {
+      "皆さん、我在インターネット上看到someone把几国language混在一起speak。我看到之后be like：それは我じゃないか！私もtry一tryです。\n"
+      "虽然是混乱している句子ですけど、中文日本語プラスEnglish、挑戦スタート！\n"
+      "我study日本語的时候，もし有汉字，我会很happy。\n"
+      "Bueause中国人として、when I see汉字，すぐに那个汉字がわかります。\n"
+      "But 我hate外来語、什么マクドナルド、スターバックス、グーグル、ディズニーランド、根本记不住カタカナhow to写、太難しい。\n"
+      "2021年6月25日,今天32°C。以上です，byebye！"
+    };
     std::string text_lang = "zh";
     std::string speaker_name = "firefly";
     std::string output_path = "streaming_output.wav";

@@ -78,6 +78,24 @@ bool StreamingPipeline::InferSpeakerStreaming(
     return false;
   }
 
+  // len(current) + len(s) < 20 则合并
+  std::vector<std::string> merged_segments;
+  std::string current;
+  for (const auto& s : segments) {
+    if (current.size() + s.size() < 20) {
+      current += s;
+    } else {
+      if (!current.empty()) {
+        merged_segments.push_back(current);
+      }
+      current = s;
+    }
+  }
+  if (!current.empty()) {
+    merged_segments.push_back(current);
+  }
+  segments = std::move(merged_segments);
+
   std::vector<float> prev_fade_out;
   int sampling_rate = m_edge_pipeline->GetSamplingRate();
 

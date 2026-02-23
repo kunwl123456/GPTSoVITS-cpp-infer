@@ -153,6 +153,24 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     return nullptr;
   }
 
+  // len(current) + len(s) < 20 则合并
+  std::vector<std::string> merged_segments;
+  std::string current;
+  for (const auto& s : segments) {
+    if (current.size() + s.size() < 20) {
+      current += s;
+    } else {
+      if (!current.empty()) {
+        merged_segments.push_back(current);
+      }
+      current = s;
+    }
+  }
+  if (!current.empty()) {
+    merged_segments.push_back(current);
+  }
+  segments = std::move(merged_segments);
+
   std::vector<float> audio_result;
 
   // 遍历每个句子段落

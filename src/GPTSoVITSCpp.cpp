@@ -230,6 +230,36 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     return nullptr;
   }
 
+  // 短句合并逻辑 (len(current) + len(s) < 20 则合并
+  std::vector<std::string> merged_segments;
+  std::string current_seg;
+  for (const auto& s : segments) {
+    if (current_seg.size() + s.size() < 20) {
+      current_seg += s;
+    } else {
+      if (!current_seg.empty()) {
+        merged_segments.push_back(current_seg);
+      }
+      current_seg = s;
+    }
+  }
+  if (!current_seg.empty()) {
+    merged_segments.push_back(current_seg);
+  }
+
+  // 重新处理合并后的 G2P
+  segments = std::move(merged_segments);
+  segment_bert_res.clear();
+  for (const auto& seg : segments) {
+    try {
+      auto target_bert_res = m_g2p_pipline->GetPhoneAndBert(seg, text_lang);
+      segment_bert_res.push_back(target_bert_res);
+    } catch (const std::exception& e) {
+      PrintError("    [Inference Error] Failed to process segment: {}", e.what());
+      segment_bert_res.push_back(nullptr);
+    }
+  }
+
   PrintDebug("Processing {} text segments", segments.size());
 
   std::vector<float> final_audio;

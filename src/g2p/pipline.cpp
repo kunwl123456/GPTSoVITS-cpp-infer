@@ -127,8 +127,32 @@ std::shared_ptr<Bert::BertRes> G2PPipline::GetPhoneAndBert(
   for (auto& t : phone_tensors) phone_ptrs.push_back(t.get());
   auto merged_phones = Model::Tensor::Concat(phone_ptrs, 0);
 
+  // 找到第一个非空的 BERT 张量作为参考，将其他张量统一到相同的设备/类型
+  Model::Device ref_device(Model::DeviceType::kCPU);
+  Model::DataType ref_dtype = Model::DataType::kFloat32;
+  for (const auto& t : bert_tensors) {
+    if (t) {
+      ref_device = t->GetDevice();
+      ref_dtype = t->Type();
+      break;
+    }
+  }
+  
+  // 转换所有 BERT 张量到统一的设备/类型
+  std::vector<std::unique_ptr<Model::Tensor>> bert_tensors_converted;
   std::vector<Model::Tensor*> bert_ptrs;
-  for (auto& t : bert_tensors) bert_ptrs.push_back(t.get());
+  for (auto& t : bert_tensors) {
+    if (t) {
+      if (t->GetDevice() != ref_device || t->Type() != ref_dtype) {
+        auto converted = t->To(ref_device, ref_dtype);
+        bert_ptrs.push_back(converted.get());
+        bert_tensors_converted.push_back(std::move(converted));
+      } else {
+        bert_ptrs.push_back(t.get());
+      }
+    }
+  }
+  
   auto merged_bert = Model::Tensor::Concat(bert_ptrs, 1);
 
   auto res = std::make_shared<Bert::BertRes>();
