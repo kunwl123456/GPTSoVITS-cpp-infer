@@ -184,6 +184,7 @@ public:
       float noise_scale, float speed) {
     PrintDebug("[InferencePipeline] Inferring segment: {}", text);
     auto device = device_ctx->GetDevice();
+    
     // G2P 处理
     auto target_bert_res = g2p_pipeline->GetPhoneAndBert(text, lang);
     if (!target_bert_res || !target_bert_res->PhoneSeq ||
@@ -191,39 +192,20 @@ public:
       PrintError("[InferencePipeline] G2P processing failed");
       return nullptr;
     }
+    
     // 获取说话人特征
-    auto ref_phones =
-        speaker.GetPhoneSeq(Model::Device(Model::DeviceType::kCPU));
-    auto ref_bert = speaker.GetBertSeq(Model::Device(Model::DeviceType::kCPU));
+    auto ref_phones = speaker.GetPhoneSeq(device);
+    auto ref_bert = speaker.GetBertSeq(device);
     auto vq_codes = speaker.GetVQCodes(device);
     auto refer_spec = speaker.GetReferSpec(device);
     auto sv_emb = speaker.GetSVEmbedding(device);
+    
     if (!vq_codes || !refer_spec || !sv_emb) {
       PrintError("[InferencePipeline] Speaker features incomplete");
       return nullptr;
     }
-    // 参考特征
-    if (ref_phones) {
-      PrintDebug("[InferencePipeline] ref_phones shape: [{}]",
-                 ref_phones->Shape()[0]);
-      if (ref_phones->ElementCount() > 5) {
-        auto* p = ref_phones->Data<int64_t>();
-        PrintDebug("[InferencePipeline] ref_phones[0..4]: {}, {}, {}, {}, {}",
-                   p[0], p[1], p[2], p[3], p[4]);
-      }
-    } else {
-      PrintWarn("[InferencePipeline] ref_phones is NULL!");
-    }
-    if (ref_bert) {
-      PrintDebug("[InferencePipeline] ref_bert shape: [{}, {}]",
-                 ref_bert->Shape().size() > 0 ? ref_bert->Shape()[0] : 0,
-                 ref_bert->Shape().size() > 1 ? ref_bert->Shape()[1] : 0);
-    } else {
-      PrintWarn("[InferencePipeline] ref_bert is NULL!");
-    }
-    PrintDebug("[InferencePipeline] vq_codes shape: [{}, {}]",
-               vq_codes->Shape().size() > 0 ? vq_codes->Shape()[0] : 0,
-               vq_codes->Shape().size() > 1 ? vq_codes->Shape()[1] : 0);
+    
+    // 获取模型
     auto gpt_encoder = model_pool.GetModel<Model::GPTEncoderModel>(
         Model::ModelType::kGPTEncoder);
     auto gpt_step =
@@ -234,139 +216,90 @@ public:
       PrintError("[InferencePipeline] Models not loaded");
       return nullptr;
     }
+    
     // 获取模型期望的数据类型和设备
     auto target_device = gpt_encoder->GetModel()->GetDevice();
     auto phone_dtype = gpt_encoder->GetModel()->GetInputDataType("phoneme_ids");
     auto bert_dtype = gpt_encoder->GetModel()->GetInputDataType("bert_feature");
-    auto prompt_dtype = gpt_encoder->GetModel()->GetInputDataType("prompts");
-    // 准备输入
-    auto ref_phones_final =
-        ref_phones ? ref_phones->To(target_device, phone_dtype) : nullptr;
-    auto target_phones_final =
-        target_bert_res->PhoneSeq->To(target_device, phone_dtype);
-    // 在 axis=0 上拼接 phones
+    
+    // ================================================================
+    // 准备 GPT Encoder 输入
+    // ================================================================
+    
+    // 一次性转换音素到目标设备和类型
+    std::unique_ptr<Model::Tensor> ref_phones_final;
+    std::unique_ptr<Model::Tensor> target_phones_final;
+    
+    if (ref_phones) {
+      ref_phones_final = ref_phones->To(target_device, phone_dtype);
+    }
+    target_phones_final = target_bert_res->PhoneSeq->To(target_device, phone_dtype);
+    
+    // 拼接 phones (axis=0)
     std::vector<Model::Tensor*> phones_to_concat;
     if (ref_phones_final) phones_to_concat.push_back(ref_phones_final.get());
     phones_to_concat.push_back(target_phones_final.get());
     auto all_phones = Model::Tensor::Concat(phones_to_concat, 0);
-    // 在 axis=1 上拼接 bert
-    auto ref_bert_final =
-        ref_bert ? ref_bert->To(target_device, bert_dtype) : nullptr;
-    auto target_bert_final =
-        target_bert_res->BertSeq->To(target_device, bert_dtype);
+    
+    // 一次性转换 BERT 特征到目标设备和类型
+    std::unique_ptr<Model::Tensor> ref_bert_final;
+    std::unique_ptr<Model::Tensor> target_bert_final;
+    
+    if (ref_bert) {
+      ref_bert_final = ref_bert->To(target_device, bert_dtype);
+    }
+    target_bert_final = target_bert_res->BertSeq->To(target_device, bert_dtype);
+    
+    // 拼接 bert (axis=1)
     std::vector<Model::Tensor*> bert_to_concat;
     if (ref_bert_final) bert_to_concat.push_back(ref_bert_final.get());
     bert_to_concat.push_back(target_bert_final.get());
     auto all_bert = Model::Tensor::Concat(bert_to_concat, 1);
-    PrintDebug(
-        "[InferencePipeline] ref_bert shape: [{}, {}]",
-        ref_bert ? (ref_bert->Shape().size() > 0 ? ref_bert->Shape()[0] : 0)
-                 : 0,
-        ref_bert ? (ref_bert->Shape().size() > 1 ? ref_bert->Shape()[1] : 0)
-                 : 0);
-    PrintDebug("[InferencePipeline] target_bert shape: [{}, {}]",
-               target_bert_res->BertSeq->Shape().size() > 0
-                   ? target_bert_res->BertSeq->Shape()[0]
-                   : 0,
-               target_bert_res->BertSeq->Shape().size() > 1
-                   ? target_bert_res->BertSeq->Shape()[1]
-                   : 0);
-    PrintDebug(
-        "[InferencePipeline] all_bert (before reshape) shape: [{}, {}, {}]",
-        all_bert->Shape().size() > 0 ? all_bert->Shape()[0] : 0,
-        all_bert->Shape().size() > 1 ? all_bert->Shape()[1] : 0,
-        all_bert->Shape().size() > 2 ? all_bert->Shape()[2] : 0);
-    // 扩展维度
+    
+    // 扩展维度 (2D -> 3D)，使用 View 避免拷贝
     if (all_bert->Shape().size() == 2) {
       all_bert->Reshape({1, all_bert->Shape()[0], all_bert->Shape()[1]});
-      PrintDebug("[InferencePipeline] Reshaped all_bert to: [{}, {}, {}]",
-                 all_bert->Shape()[0], all_bert->Shape()[1],
-                 all_bert->Shape()[2]);
     }
+    
     // 确保精度一致
     if (all_bert->Type() != compute_precision) {
-      PrintDebug(
-          "[InferencePipeline] Converting bert_feature from {} to {} for GPT "
-          "Encoder",
-          all_bert->Type() == Model::DataType::kFloat32 ? "float32" : "float16",
-          compute_precision == Model::DataType::kFloat32 ? "float32"
-                                                         : "float16");
       all_bert = all_bert->To(all_bert->GetDevice(), compute_precision);
     }
-    // 准备 phoneme_ids 和 prompts
+    
+    // 准备 phoneme_ids
     auto phoneme_ids = all_phones->To(Model::Device(Model::DeviceType::kCPU),
                                       Model::DataType::kInt64);
     if (phoneme_ids->Shape().size() == 1) {
       phoneme_ids->Reshape({1, phoneme_ids->Shape()[0]});
     }
+    
+    // 准备 prompts
     auto prompts = vq_codes->To(Model::Device(Model::DeviceType::kCPU),
                                 Model::DataType::kInt64);
     if (prompts->Shape().size() == 1) {
       prompts->Reshape({1, prompts->Shape()[0]});
     }
+    
     PrintDebug("[InferencePipeline] GPT Encoder inputs:");
-    PrintDebug(
-        "  phoneme_ids shape: [{}, {}], dtype: {}", phoneme_ids->Shape()[0],
-        phoneme_ids->Shape()[1],
-        phoneme_ids->Type() == Model::DataType::kInt64 ? "int64" : "other");
-    if (phoneme_ids->ElementCount() > 5) {
-      auto* p_ids = phoneme_ids->Data<int64_t>();
-      PrintDebug("  phoneme_ids[0..4]: {}, {}, {}, {}, {}", p_ids[0], p_ids[1],
-                 p_ids[2], p_ids[3], p_ids[4]);
-    }
-    PrintDebug("  prompts shape: [{}, {}], dtype: {}", prompts->Shape()[0],
-               prompts->Shape()[1],
-               prompts->Type() == Model::DataType::kInt64 ? "int64" : "other");
-    if (prompts->ElementCount() > 5) {
-      auto* p_prompts = prompts->Data<int64_t>();
-      PrintDebug("  prompts[0..4]: {}, {}, {}, {}, {}", p_prompts[0],
-                 p_prompts[1], p_prompts[2], p_prompts[3], p_prompts[4]);
-    }
-    PrintDebug(
-        "  bert_feature shape: [{}, {}, {}], dtype: {}", all_bert->Shape()[0],
-        all_bert->Shape()[1], all_bert->Shape()[2],
-        all_bert->Type() == Model::DataType::kFloat16 ? "float16" : "float32");
+    PrintDebug("  phoneme_ids: [{}, {}], bert_feature: [{}, {}, {}]",
+               phoneme_ids->Shape()[0], phoneme_ids->Shape()[1],
+               all_bert->Shape()[0], all_bert->Shape()[1], all_bert->Shape()[2]);
+    
+    // ================================================================
     // GPT Encoder
+    // ================================================================
     auto encoder_output =
         gpt_encoder->Encode(phoneme_ids.get(), prompts.get(), all_bert.get());
-    // 检查 encoder 输出
-    if (encoder_output.topk_values &&
-        encoder_output.topk_values->ElementCount() > 0) {
-      auto topk_values_cpu = encoder_output.topk_values->To(
-          Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
-      auto topk_indices_cpu = encoder_output.topk_indices->To(
-          Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
-      const float* enc_values = topk_values_cpu->Data<float>();
-      const int64_t* enc_indices = topk_indices_cpu->Data<int64_t>();
-      int enc_k = topk_values_cpu->ElementCount();
-      PrintDebug(
-          "[InferencePipeline] GPT Encoder topk_values[0..5]: {:.4f}, {:.4f}, "
-          "{:.4f}, {:.4f}, {:.4f}",
-          enc_values[0], enc_values[1], enc_values[2], enc_values[3],
-          enc_values[4]);
-      PrintDebug(
-          "[InferencePipeline] GPT Encoder topk_indices[0..5]: {}, {}, {}, {}, "
-          "{}",
-          enc_indices[0], enc_indices[1], enc_indices[2], enc_indices[3],
-          enc_indices[4]);
-      bool enc_has_nan = false;
-      for (int j = 0; j < enc_k; ++j) {
-        if (!std::isfinite(enc_values[j])) {
-          enc_has_nan = true;
-          break;
-        }
-      }
-      if (enc_has_nan) {
-        PrintError(
-            "[InferencePipeline] GPT Encoder topk_values contains NaN/Inf!");
-      }
-    }
+    
     // 采样第一个 token
     int64_t first_token = Utils::SampleTopK(encoder_output.topk_values.get(),
                                             encoder_output.topk_indices.get(),
                                             sample_config.temperature);
     PrintDebug("[InferencePipeline] First sampled token: {}", first_token);
-    // 准备 GPT Step 循环
+    
+    // ================================================================
+    // GPT Step 自回归生成
+    // ================================================================
     auto current_samples = Model::Tensor::Empty({1, 1}, Model::DataType::kInt64,
                                                 Model::DeviceType::kCPU);
     current_samples->At<int64_t>(0) = first_token;
@@ -374,258 +307,187 @@ public:
     auto v_cache = std::move(encoder_output.v_cache);
     auto x_len = std::move(encoder_output.x_len);
     auto y_len = std::move(encoder_output.y_len);
-    std::vector<std::unique_ptr<Model::Tensor>> generated_tokens;
+    
+    // 使用 vector<int64_t> 存储生成的 tokens，避免多次 Tensor 创建
+    std::vector<int64_t> generated_tokens;
     const int64_t eos_token = 1024;
     const int max_steps = 1500;
+    
     if (first_token != eos_token) {
-      generated_tokens.push_back(current_samples->Clone());
+      generated_tokens.push_back(first_token);
     }
-    // GPT Step 循环
+    
+    // 预分配 idx tensor（可以重用）
+    auto idx = Model::Tensor::Empty({1}, Model::DataType::kInt64,
+                                    Model::DeviceType::kCPU);
+    
     int consecutive_invalid_count = 0;
     const int max_consecutive_invalid = 10;
+    
     for (int step = 0; step < max_steps; ++step) {
-      auto idx = Model::Tensor::Empty({1}, Model::DataType::kInt64,
-                                      Model::DeviceType::kCPU);
       idx->At<int64_t>(0) = step;
+      
       auto step_output =
           gpt_step->Step(current_samples.get(), k_cache.get(), v_cache.get(),
                          idx.get(), x_len.get(), y_len.get());
+      
       // 检查输出有效性
-      bool output_valid = true;
-      if (!step_output.topk_values ||
-          step_output.topk_values->ElementCount() == 0) {
-        PrintError("[InferencePipeline] Step {} failed: topk_values is empty",
-                   step);
-        output_valid = false;
-      } else {
-        // 检查 NaN/Inf
-        auto topk_values_cpu = step_output.topk_values->To(
-            Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
-        const float* values = topk_values_cpu->Data<float>();
-        int k = topk_values_cpu->ElementCount();
-        for (int j = 0; j < k; ++j) {
-          if (!std::isfinite(values[j])) {
-            PrintError(
-                "[InferencePipeline] Step {} failed: topk_values contains "
-                "NaN/Inf",
-                step);
+      bool output_valid = step_output.topk_values && 
+                          step_output.topk_values->ElementCount() > 0 &&
+                          step_output.k_cache_new && step_output.v_cache_new;
+      
+      if (output_valid) {
+        // 快速 NaN 检查
+        auto topk_cpu = step_output.topk_values->ToCPU();
+        const float* vals = topk_cpu->Data<float>();
+        for (int j = 0; j < topk_cpu->ElementCount(); ++j) {
+          if (!std::isfinite(vals[j])) {
             output_valid = false;
             break;
           }
         }
       }
+      
       if (!output_valid) {
         consecutive_invalid_count++;
         if (consecutive_invalid_count >= max_consecutive_invalid) {
-          PrintError(
-              "[InferencePipeline] GPT Step failed {} times consecutively, "
-              "terminating at step {}",
-              consecutive_invalid_count, step);
+          PrintError("[InferencePipeline] GPT Step failed {} times, stopping",
+                     consecutive_invalid_count);
           break;
         }
-        // 使用上一个 token 继续
-        auto next_tensor = Model::Tensor::Empty({1, 1}, Model::DataType::kInt64,
-                                                Model::DeviceType::kCPU);
-        next_tensor->At<int64_t>(0) = current_samples->At<int64_t>(0);
-        current_samples = next_tensor->Clone();
-        generated_tokens.push_back(std::move(next_tensor));
+        // 重用上一个 token
+        generated_tokens.push_back(current_samples->At<int64_t>(0));
         continue;
       }
+      
       consecutive_invalid_count = 0;
-      // 更新 cache
       k_cache = std::move(step_output.k_cache_new);
       v_cache = std::move(step_output.v_cache_new);
-      // 采样
-      int64_t next_token =
-          Utils::SampleTopK(step_output.topk_values.get(),
-                            step_output.topk_indices.get(), sample_config.temperature);
-      // 检查 token 有效性
+      
+      int64_t next_token = Utils::SampleTopK(step_output.topk_values.get(),
+                                             step_output.topk_indices.get(),
+                                             sample_config.temperature);
+      
+      // Token 有效性检查
       if (next_token < 0 || next_token > eos_token) {
-        PrintWarn(
-            "[InferencePipeline] Step {} generated invalid token {}, clamping",
-            step, next_token);
-        next_token =
-            std::max<int64_t>(0, std::min<int64_t>(next_token, eos_token));
+        next_token = std::clamp(next_token, (int64_t)0, eos_token);
       }
-      auto next_tensor = Model::Tensor::Empty({1, 1}, Model::DataType::kInt64,
-                                              Model::DeviceType::kCPU);
-      next_tensor->At<int64_t>(0) = next_token;
-      current_samples = next_tensor->Clone();
-      // 先加入列表（包括 EOS），再检查是否终止
-      generated_tokens.push_back(std::move(next_tensor));
+      
+      current_samples->At<int64_t>(0) = next_token;
+      generated_tokens.push_back(next_token);
+      
       if (next_token == eos_token) {
         PrintDebug("[InferencePipeline] EOS at step {}", step);
         break;
       }
     }
+    
     if (generated_tokens.empty()) {
       PrintWarn("[InferencePipeline] No tokens generated");
       return AudioTools::FromByte({}, sampling_rate);
     }
-    PrintDebug("[InferencePipeline] Generated {} tokens",
-               generated_tokens.size());
-    // 拼接生成的 tokens
-    std::vector<std::unique_ptr<Model::Tensor>> semantic_cpu_list;
-    std::vector<Model::Tensor*> semantic_ptrs;
-    // 先加入 VQ codes (prompts)
-    semantic_cpu_list.push_back(vq_codes->ToCPU());
-    semantic_ptrs.push_back(semantic_cpu_list.back().get());
-    // 再加入生成的 tokens
-    for (const auto& t : generated_tokens) {
-      semantic_cpu_list.push_back(t->ToCPU());
-      semantic_ptrs.push_back(semantic_cpu_list.back().get());
+    
+    PrintDebug("[InferencePipeline] Generated {} tokens", generated_tokens.size());
+    
+    // ================================================================
+    // 构建 generated_sem
+    // ================================================================
+    int prompt_len = vq_codes->Shape().size() > 1 ? vq_codes->Shape()[1] : vq_codes->Shape()[0];
+    int generated_len = static_cast<int>(generated_tokens.size());
+    
+    // 移除末尾的 EOS token
+    if (!generated_tokens.empty() && generated_tokens.back() == eos_token) {
+      generated_tokens.pop_back();
+      generated_len--;
     }
-    auto pred_semantic = Model::Tensor::Concat(semantic_ptrs, 1);
-    PrintDebug("[InferencePipeline] pred_semantic shape after concat: [{}, {}]",
-               pred_semantic->Shape()[0], pred_semantic->Shape()[1]);
-    // 移除 prompt 部分（VQ codes）
-    int prompt_len = vq_codes->Shape()[1];
-    int generated_len = pred_semantic->Shape()[1] - prompt_len;
+    
     if (generated_len <= 0) {
-      PrintError(
-          "[InferencePipeline] Generated semantic length is non-positive: {}",
-          generated_len);
+      PrintError("[InferencePipeline] Generated semantic length is non-positive");
       return AudioTools::FromByte({}, sampling_rate);
     }
-    auto generated_sem =
-        Model::Tensor::Empty({1, 1, generated_len}, Model::DataType::kInt64,
-                             Model::DeviceType::kCPU);
-    auto pred_semantic_data = pred_semantic->Data<int64_t>();
-    auto generated_sem_data = generated_sem->Data<int64_t>();
-    std::memcpy(generated_sem_data, pred_semantic_data + prompt_len,
+    
+    // 创建 generated_sem tensor (1, 1, generated_len)
+    auto generated_sem = Model::Tensor::Empty({1, 1, generated_len}, 
+                                              Model::DataType::kInt64,
+                                              Model::DeviceType::kCPU);
+    std::memcpy(generated_sem->Data<int64_t>(), generated_tokens.data(),
                 generated_len * sizeof(int64_t));
-    // 移除末尾的 EOS token
-    if (generated_sem->Shape()[2] > 0) {
-      int64_t last_token =
-          generated_sem->At<int64_t>(generated_sem->Shape()[2] - 1);
-      if (last_token == eos_token) {
-        auto trimmed_sem = Model::Tensor::Empty(
-            {1, 1, generated_sem->Shape()[2] - 1}, Model::DataType::kInt64,
-            Model::DeviceType::kCPU);
-        std::memcpy(trimmed_sem->Data<int64_t>(),
-                    generated_sem->Data<int64_t>(),
-                    (generated_sem->Shape()[2] - 1) * sizeof(int64_t));
-        generated_sem = std::move(trimmed_sem);
-        PrintDebug("[InferencePipeline] Removed trailing EOS token");
-      }
-    }
-    PrintDebug(
-        "[InferencePipeline] generated_sem shape for SoVITS: [{}, {}, {}]",
-        generated_sem->Shape()[0], generated_sem->Shape()[1],
-        generated_sem->Shape()[2]);
-    if (generated_sem->Shape()[2] > 5) {
-      auto* sem_data = generated_sem->Data<int64_t>();
-      PrintDebug("[InferencePipeline] generated_sem[0..4]: {}, {}, {}, {}, {}",
-                 sem_data[0], sem_data[1], sem_data[2], sem_data[3],
-                 sem_data[4]);
-      PrintDebug(
-          "[InferencePipeline] generated_sem[last 5]: {}, {}, {}, {}, {}",
-          sem_data[generated_sem->Shape()[2] - 5],
-          sem_data[generated_sem->Shape()[2] - 4],
-          sem_data[generated_sem->Shape()[2] - 3],
-          sem_data[generated_sem->Shape()[2] - 2],
-          sem_data[generated_sem->Shape()[2] - 1]);
-    }
+    
+    // ================================================================
     // SoVITS 解码
-    auto pred_semantic_final = generated_sem->To(
-        sovits->GetModel()->GetDevice(),
-        sovits->GetModel()->GetInputDataType("pred_semantic"));
-    // text_seq: (1, seq_len)
+    // ================================================================
+    auto sovits_device = sovits->GetModel()->GetDevice();
+    auto pred_dtype = sovits->GetModel()->GetInputDataType("pred_semantic");
+    auto text_dtype = sovits->GetModel()->GetInputDataType("text_seq");
+    auto spec_dtype = sovits->GetModel()->GetInputDataType("refer_spec");
+    auto sv_dtype = sovits->GetModel()->GetInputDataType("sv_emb");
+    
+    // 直接构建正确形状的输入，避免 reshape
+    auto pred_semantic_final = generated_sem->To(sovits_device, pred_dtype);
+    
+    // text_seq: 直接从 PhoneSeq 构建 (1, seq_len)
     auto text_seq = target_bert_res->PhoneSeq->To(
         Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
     if (text_seq->Shape().size() == 1) {
       text_seq->Reshape({1, text_seq->Shape()[0]});
     }
-    auto text_seq_final =
-        text_seq->To(sovits->GetModel()->GetDevice(),
-                     sovits->GetModel()->GetInputDataType("text_seq"));
-    PrintDebug("[InferencePipeline] text_seq shape: [{}, {}]",
-               text_seq->Shape()[0], text_seq->Shape()[1]);
-    if (text_seq->ElementCount() > 5) {
-      auto* text_data = text_seq->Data<int64_t>();
-      PrintDebug("[InferencePipeline] text_seq[0..4]: {}, {}, {}, {}, {}",
-                 text_data[0], text_data[1], text_data[2], text_data[3],
-                 text_data[4]);
+    auto text_seq_final = text_seq->To(sovits_device, text_dtype);
+    
+    // refer_spec: 确保 3D
+    Model::Tensor* refer_spec_ptr = refer_spec;
+    std::unique_ptr<Model::Tensor> refer_spec_reshaped;
+    if (refer_spec->Shape().size() == 2) {
+      refer_spec_reshaped = refer_spec->View({1, refer_spec->Shape()[0], 
+                                              refer_spec->Shape()[1]});
+      refer_spec_ptr = refer_spec_reshaped.get();
     }
-    // refer_spec: (1, n_mels, time)
-    auto refer_spec_input = refer_spec;
-    std::unique_ptr<Model::Tensor> refer_spec_expanded;
-    if (refer_spec_input->Shape().size() == 2) {
-      refer_spec_expanded = refer_spec_input->Clone();
-      refer_spec_expanded->Reshape(
-          {1, refer_spec_input->Shape()[0], refer_spec_input->Shape()[1]});
-      refer_spec_input = refer_spec_expanded.get();
+    auto refer_spec_final = refer_spec_ptr->To(sovits_device, spec_dtype);
+    
+    // sv_emb: 确保 2D
+    Model::Tensor* sv_emb_ptr = sv_emb;
+    std::unique_ptr<Model::Tensor> sv_emb_reshaped;
+    if (sv_emb->Shape().size() == 1) {
+      sv_emb_reshaped = sv_emb->View({1, sv_emb->Shape()[0]});
+      sv_emb_ptr = sv_emb_reshaped.get();
     }
-    auto refer_spec_final = refer_spec_input->To(
-        sovits->GetModel()->GetDevice(),
-        sovits->GetModel()->GetInputDataType("refer_spec"));
-    PrintDebug(
-        "[InferencePipeline] refer_spec shape: [{}, {}, {}]",
-        refer_spec_input->Shape()[0],
-        refer_spec_input->Shape().size() > 1 ? refer_spec_input->Shape()[1] : 0,
-        refer_spec_input->Shape().size() > 2 ? refer_spec_input->Shape()[2]
-                                             : 0);
-    // sv_emb: (1, sv_dim)
-    auto sv_emb_input = sv_emb;
-    std::unique_ptr<Model::Tensor> sv_emb_expanded;
-    if (sv_emb_input->Shape().size() == 1) {
-      sv_emb_expanded = sv_emb_input->Clone();
-      sv_emb_expanded->Reshape({1, sv_emb_input->Shape()[0]});
-      sv_emb_input = sv_emb_expanded.get();
-    }
-    auto sv_emb_final =
-        sv_emb_input->To(sovits->GetModel()->GetDevice(),
-                         sovits->GetModel()->GetInputDataType("sv_emb"));
-    PrintDebug("[InferencePipeline] sv_emb shape: [{}, {}]",
-               sv_emb_input->Shape()[0],
-               sv_emb_input->Shape().size() > 1 ? sv_emb_input->Shape()[1] : 0);
+    auto sv_emb_final = sv_emb_ptr->To(sovits_device, sv_dtype);
+    
+    // SoVITS 推理
     auto audio_tensor = sovits->GenerateTensor(
         pred_semantic_final.get(), text_seq_final.get(), refer_spec_final.get(),
         sv_emb_final.get(), noise_scale, speed);
+    
     if (!audio_tensor) {
       PrintError("[InferencePipeline] SoVITS generation failed");
       return nullptr;
     }
-    PrintDebug("[InferencePipeline] SoVITS output audio samples: {}",
-               audio_tensor->ElementCount());
-    // 提取音频
+    
+    // ================================================================
+    // 音频后处理
+    // ================================================================
     auto audio_cpu = audio_tensor->To(Model::Device(Model::DeviceType::kCPU),
                                       Model::DataType::kFloat32);
     if (!audio_cpu || audio_cpu->ElementCount() == 0) {
       PrintError("[InferencePipeline] Failed to convert audio to CPU");
       return AudioTools::FromByte({}, sampling_rate);
     }
+    
     size_t audio_size = audio_cpu->ElementCount();
     const float* audio_ptr = audio_cpu->Data<float>();
-    // 验证指针有效性
-    if (!audio_ptr) {
-      PrintError("[InferencePipeline] Audio data pointer is null");
-      return AudioTools::FromByte({}, sampling_rate);
-    }
-    std::vector<float> audio_data(audio_size);
-    std::memcpy(audio_data.data(), audio_ptr, audio_size * sizeof(float));
-    if (audio_size > 0) {
-      float min_val = audio_data[0];
-      float max_val = audio_data[0];
-      float sum = 0.0f;
-      for (size_t i = 0; i < audio_size; ++i) {
-        if (audio_data[i] < min_val) min_val = audio_data[i];
-        if (audio_data[i] > max_val) max_val = audio_data[i];
-        sum += std::abs(audio_data[i]);
-      }
-      float avg_amp = sum / static_cast<float>(audio_size);
-      PrintDebug(
-          "[InferencePipeline] Audio data range: min={:.6f}, max={:.6f}, "
-          "avg_amp={:.6f}",
-          min_val, max_val, avg_amp);
-      if (audio_size >= 5) {
-        PrintDebug(
-            "[InferencePipeline] Audio samples [0..4]: {:.6f}, {:.6f}, {:.6f}, "
-            "{:.6f}, {:.6f}",
-            audio_data[0], audio_data[1], audio_data[2], audio_data[3],
-            audio_data[4]);
-      }
-    }
+    
+    // 直接从指针构造 vector
+    std::vector<float> audio_data(audio_ptr, audio_ptr + audio_size);
+    
+    // DC offset 去除 - 与 Python 一致
+    // Python: audio_np = audio_np - np.mean(audio_np)
+    float mean = 0.0f;
+    for (const auto& s : audio_data) mean += s;
+    mean /= static_cast<float>(audio_size);
+    for (auto& s : audio_data) s -= mean;
+    
+    PrintDebug("[InferencePipeline] Audio: {} samples, DC offset: {:.6f}",
+               audio_size, mean);
+    
     return AudioTools::FromByte(audio_data, sampling_rate);
   }
 };
@@ -710,6 +572,7 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
     return nullptr;
   }
   std::string use_lang = lang.empty() ? impl_->config.default_lang : lang;
+  
   // 文本分句
   Text::Sentence sentence(Text::Sentence::SentenceSplitMethod::Punctuation);
   std::vector<std::string> segments;
@@ -717,48 +580,71 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
     segments.push_back(s);
     return true;
   });
-  // 逐块添加文本
-  int chunk_size = 11;
-  int index = 0;
-  while (index < text.size()) {
-    std::string chunk = text.substr(index, chunk_size);
-    sentence.Append(chunk);
-    index += chunk_size;
-  }
+
+  sentence.Append(text);
   sentence.Flush();
+  
   if (segments.empty()) {
     PrintWarn("[InferencePipeline] No text segments to process");
     return nullptr;
   }
+  
+  PrintInfo("[InferencePipeline] Processing {} segments", segments.size());
+  
   // 预加载说话人特征到设备
   speaker->EnsureOnDevice(impl_->device_ctx->GetDevice());
+  
   // 处理每个段落
   std::vector<float> final_audio;
   for (size_t i = 0; i < segments.size(); ++i) {
+    PrintDebug("[InferencePipeline] Processing segment {}/{}: {}", 
+               i + 1, segments.size(), segments[i]);
+    
     auto audio = impl_->InferSegment(*speaker, segments[i], use_lang,
                                      sample_config, noise_scale, speed);
     if (audio) {
       auto samples = audio->ReadSamples();
+      
+      // 每个 segment 进行 DC offset 去除
       final_audio.insert(final_audio.end(), samples.begin(), samples.end());
-      // 添加停顿
+      
+      // 添加段落间停顿
       if (i < segments.size() - 1) {
         int pause_samples = static_cast<int>(impl_->sampling_rate * 0.3f);
         final_audio.insert(final_audio.end(), pause_samples, 0.0f);
       }
     }
   }
-  // 归一化
+  
+  // ================================================================
+  // Global Peak Normalization
+  // max_amp = np.abs(full_audio).max()
+  //         if max_amp > 1e-5: full_audio = full_audio / max_amp * 0.9
+  // ================================================================
   if (!final_audio.empty()) {
-    float max_amp = *std::max_element(
-        final_audio.begin(), final_audio.end(),
-        [](float a, float b) { return std::abs(a) < std::abs(b); });
-    if (max_amp > 0.9f) {
+    // 计算最大绝对值
+    float max_amp = 0.0f;
+    for (const auto& s : final_audio) {
+      float abs_val = std::abs(s);
+      if (abs_val > max_amp) max_amp = abs_val;
+    }
+    
+    PrintDebug("[InferencePipeline] Global max amplitude: {:.6f}", max_amp);
+    
+    // 只有当 max_amp > 1e-5 时才进行归一化
+    if (max_amp > 1e-5f) {
       float scale = 0.9f / max_amp;
       for (auto& sample : final_audio) {
         sample *= scale;
       }
+      PrintDebug("[InferencePipeline] Applied global normalization, scale: {:.6f}", scale);
     }
   }
+  
+  PrintInfo("[InferencePipeline] Generated audio: {} samples ({:.2f}s)", 
+            final_audio.size(), 
+            static_cast<float>(final_audio.size()) / impl_->sampling_rate);
+  
   return AudioTools::FromByte(final_audio, impl_->sampling_rate);
 }
 std::unique_ptr<AudioTools> InferencePipeline::Infer(

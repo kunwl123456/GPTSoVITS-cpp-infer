@@ -21,6 +21,23 @@
 namespace GPTSoVITS {
 namespace Utils {
 
+namespace {
+// 线程局部 RNG
+std::mt19937& GetGlobalRNG() {
+  static thread_local std::mt19937 rng([]() {
+    std::random_device rd;
+    std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
+    return std::mt19937(seq);
+  }());
+  return rng;
+}
+
+std::vector<float>& GetThreadLocalProbsBuffer() {
+  static thread_local std::vector<float> probs;
+  return probs;
+}
+}  // namespace
+
 // ============================================================================
 // Sampler 类实现
 // ============================================================================
@@ -31,6 +48,8 @@ Sampler::~Sampler() = default;
 
 void Sampler::SetSeed(unsigned int seed) {
   rng_.seed(seed);
+  // 同时重置全局 RNG
+  GetGlobalRNG().seed(seed);
 }
 
 int64_t Sampler::Sample(const Model::Tensor* logits, const SamplingConfig& config) {
@@ -180,8 +199,7 @@ int64_t Sampler::SampleZeroCopy(
 // ============================================================================
 // 全局函数实现
 // ============================================================================
-constexpr auto _FLT_MAX_ = std::numeric_limits<float>::max();
-constexpr auto _FLT_MIN_ = std::numeric_limits<float>::min();
+
 void StableSoftmax(
     const float* logits,
     float* probs,
@@ -189,36 +207,29 @@ void StableSoftmax(
     float temperature) {
   if (size == 0) return;
   
-  // 找最大值
+  // 找最大值 (数值稳定性关键)
   float max_val = logits[0];
   for (size_t i = 1; i < size; ++i) {
     if (logits[i] > max_val) max_val = logits[i];
   }
   
   // 计算 exp((x - max) / temperature)
-  // topk_values = topk_values - np.max(topk_values)
-  //              probs = np.exp(topk_values)
+  // Python: topk_values = topk_values - np.max(topk_values)
+  //         probs = np.exp(topk_values)
   float sum = 0.0f;
   for (size_t i = 0; i < size; ++i) {
     float logit = (logits[i] - max_val) / temperature;
-    
-    // 数值稳定性截断：防止exp溢出
-    if (logit < _FLT_MIN_) {
-      probs[i] = 0.0f;
-    } else if (logit > _FLT_MAX_) {
-      probs[i] = std::exp(_FLT_MAX_);
-    } else {
-      probs[i] = std::exp(logit);
-    }
-    
+    // 防止 underflow: exp(-88) ~ 1e-38，已经很小
+    probs[i] = (logit < -88.0f) ? 0.0f : std::exp(logit);
     sum += probs[i];
   }
   
   // 归一化
-  // probs /= np.sum(probs)
+  // Python: probs /= np.sum(probs)
   if (sum > 1e-10f) {
+    float inv_sum = 1.0f / sum;
     for (size_t i = 0; i < size; ++i) {
-      probs[i] /= sum;
+      probs[i] *= inv_sum;
     }
   } else {
     // 所有概率都接近0，使用均匀分布
@@ -251,79 +262,96 @@ int64_t SampleTopK(
     return 0;
   }
 
-  std::unique_ptr<Model::Tensor> values_cpu;
-  if (topk_values->Type() == Model::DataType::kFloat32) {
-    values_cpu = topk_values->IsCPU() ? topk_values->Clone() : topk_values->ToCPU();
+  // 一次性完成类型转换和设备迁移，减少中间拷贝
+  std::unique_ptr<Model::Tensor> values_cpu_owner;
+  std::unique_ptr<Model::Tensor> indices_cpu_owner;
+  
+  const float* values_ptr = nullptr;
+  const int64_t* indices_ptr = nullptr;
+  int64_t k = topk_values->ElementCount();
+  
+  // 处理 values 必须是 float32 且在 CPU
+  if (topk_values->IsCPU() && topk_values->Type() == Model::DataType::kFloat32) {
+    values_ptr = topk_values->Data<float>();
+  } else if (topk_values->IsCPU()) {
+    // 仅需类型转换
+    values_cpu_owner = topk_values->ToType(Model::DataType::kFloat32);
+    values_ptr = values_cpu_owner->Data<float>();
   } else {
-    // 非 float32 类型需要显式转换
-    values_cpu = topk_values->IsCPU() 
-        ? topk_values->ToType(Model::DataType::kFloat32)
-        : topk_values->ToCPU()->ToType(Model::DataType::kFloat32);
+    // 需要设备迁移 + 类型转换
+    values_cpu_owner = topk_values->ToCPU();
+    if (values_cpu_owner->Type() != Model::DataType::kFloat32) {
+      values_cpu_owner = values_cpu_owner->ToType(Model::DataType::kFloat32);
+    }
+    values_ptr = values_cpu_owner->Data<float>();
   }
   
-  auto indices_cpu = topk_indices->IsCPU() 
-      ? topk_indices->Clone() 
-      : topk_indices->ToCPU();
-  
-  int64_t k = values_cpu->ElementCount();
-  const float* values_ptr = values_cpu->Data<float>();
-  const int64_t* indices_ptr = indices_cpu->Data<int64_t>();
+  // 处理 indices 必须是 int64 且在 CPU
+  if (topk_indices->IsCPU() && topk_indices->Type() == Model::DataType::kInt64) {
+    indices_ptr = topk_indices->Data<int64_t>();
+  } else if (topk_indices->IsCPU()) {
+    indices_cpu_owner = topk_indices->ToType(Model::DataType::kInt64);
+    indices_ptr = indices_cpu_owner->Data<int64_t>();
+  } else {
+    indices_cpu_owner = topk_indices->ToCPU();
+    if (indices_cpu_owner->Type() != Model::DataType::kInt64) {
+      indices_cpu_owner = indices_cpu_owner->ToType(Model::DataType::kInt64);
+    }
+    indices_ptr = indices_cpu_owner->Data<int64_t>();
+  }
   
   // 检查温度参数有效性
   if (temperature <= 1e-6f) {
     temperature = 1.0f;
   }
   
+  // 使用线程局部缓冲区，避免每次分配
+  auto& probs = GetThreadLocalProbsBuffer();
+  if (probs.size() < static_cast<size_t>(k)) {
+    probs.resize(static_cast<size_t>(k));
+  }
+  
   // ================================================================
-  //   topk_values = topk_values - np.max(topk_values, axis=-1, keepdims=True)
+  //   topk_values = topk_values - np.max(topk_values)
   //   probs = np.exp(topk_values)
-  //   probs /= np.sum(probs, axis=-1, keepdims=True)
+  //   probs /= np.sum(probs)
   // ================================================================
   
-  // 找最大值
+  // 找最大值 (数值稳定性)
   float max_val = values_ptr[0];
   for (int64_t i = 1; i < k; ++i) {
     if (values_ptr[i] > max_val) max_val = values_ptr[i];
   }
   
-  // 计算 softmax 概率
-  std::vector<float> probs(static_cast<size_t>(k));
+  // 计算 exp((x - max) / temperature) 并求和
   float sum = 0.0f;
-  
   for (int64_t i = 0; i < k; ++i) {
     float logit = (values_ptr[i] - max_val) / temperature;
-    
-    // 数值稳定性截断
-    if (logit < _FLT_MIN_) {
-      probs[i] = 0.0f;
-    } else if (logit > _FLT_MAX_) {
-      probs[i] = std::exp(_FLT_MAX_);
-    } else {
-      probs[i] = std::exp(logit);
-    }
-    
+    // 防止 exp 溢出，最大值减去 max_val 后为 0，所以 logit <= 0
+    // 只有很小的负值可能导致 underflow
+    probs[i] = (logit < std::numeric_limits<float>::min()) ? 0.0f : std::exp(logit);
     sum += probs[i];
   }
   
   // 归一化
   if (sum > 1e-10f) {
+    float inv_sum = 1.0f / sum;
     for (int64_t i = 0; i < k; ++i) {
-      probs[i] /= sum;
+      probs[i] *= inv_sum;
     }
   } else {
-    // 均匀分布 fallback
+    // 均匀分布 fallback（如果频繁触发就是有问题）
     float uniform = 1.0f / static_cast<float>(k);
     for (int64_t i = 0; i < k; ++i) {
       probs[i] = uniform;
     }
   }
   
-  // 多项式采样
+  // 全局 RNG 多项式采样
   try {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    int choice = dist(gen);
+    auto& rng = GetGlobalRNG();
+    std::discrete_distribution<int> dist(probs.begin(), probs.begin() + k);
+    int choice = dist(rng);
     return indices_ptr[choice];
   } catch (const std::exception& e) {
     PrintError("[SampleTopK] discrete_distribution failed: {}", e.what());

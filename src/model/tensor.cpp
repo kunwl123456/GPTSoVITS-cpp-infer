@@ -503,9 +503,10 @@ std::unique_ptr<Tensor> Tensor::Concat(const std::vector<Tensor*>& tensors, int 
   DataType dtype = tensors[0]->Type();
   Device device = tensors[0]->GetDevice();
   auto base_shape = tensors[0]->Shape();
+  int ndim = static_cast<int>(base_shape.size());
 
-  if (axis < 0) axis += static_cast<int>(base_shape.size());
-  if (axis < 0 || axis >= static_cast<int>(base_shape.size())) {
+  if (axis < 0) axis += ndim;
+  if (axis < 0 || axis >= ndim) {
     THROW_ERRORN("Concat: axis out of range.");
   }
 
@@ -517,8 +518,8 @@ std::unique_ptr<Tensor> Tensor::Concat(const std::vector<Tensor*>& tensors, int 
       THROW_ERRORN("Concat: all tensors must have the same data type and device.");
     }
     auto s = t->Shape();
-    if (s.size() != base_shape.size()) THROW_ERRORN("Concat: dimension mismatch.");
-    for (int i = 0; i < s.size(); ++i) {
+    if (static_cast<int>(s.size()) != ndim) THROW_ERRORN("Concat: dimension mismatch.");
+    for (int i = 0; i < ndim; ++i) {
       if (i != axis && s[i] != base_shape[i]) THROW_ERRORN("Concat: shape mismatch on non-concat axis.");
     }
     total_dim += s[axis];
@@ -527,8 +528,11 @@ std::unique_ptr<Tensor> Tensor::Concat(const std::vector<Tensor*>& tensors, int 
 
   auto out_tensor = Empty(out_shape, dtype, device);
   uint8_t* dst_ptr = out_tensor->Data<uint8_t>();
-  
+  size_t element_size = ElementSize(dtype);
+
+  // 对于 axis == 0 或最后一维，可以直接连续拷贝
   if (axis == 0) {
+    // 直接连续拷贝每个 tensor
     for (auto t : tensors) {
       size_t b = t->ByteSize();
       if (device.type == DeviceType::kCPU) {
@@ -540,26 +544,76 @@ std::unique_ptr<Tensor> Tensor::Concat(const std::vector<Tensor*>& tensors, int 
       }
       dst_ptr += b;
     }
-  } else {
-    if (base_shape.size() == 2 && axis == 1) {
-      int64_t row_count = base_shape[0];
-      size_t element_size = ElementSize(dtype);
-      for (int64_t r = 0; r < row_count; ++r) {
-        for (auto t : tensors) {
-          size_t row_bytes = t->Shape()[1] * element_size;
-          void* src = static_cast<uint8_t*>(t->Data()) + r * row_bytes;
-          if (device.type == DeviceType::kCPU) {
-            std::memcpy(dst_ptr, src, row_bytes);
-          } else {
+  } else if (axis == ndim - 1) {
+    // 最后一维拼接
+    // 每行内连续拷贝
+    // 计算每个 tensor 每行的字节数和输出每行的字节数
+    std::vector<size_t> row_bytes(tensors.size());
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      row_bytes[i] = tensors[i]->Shape()[axis] * element_size;
+    }
+    
+    // 计算总行数（其他维度的乘积）
+    int64_t num_rows = 1;
+    for (int i = 0; i < axis; ++i) {
+      num_rows *= base_shape[i];
+    }
+    
+    // 计算每个 tensor 的行步长
+    std::vector<size_t> row_stride(tensors.size());
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      row_stride[i] = row_bytes[i];
+    }
+    
+    // 逐行拼接
+    for (int64_t r = 0; r < num_rows; ++r) {
+      for (size_t t = 0; t < tensors.size(); ++t) {
+        const uint8_t* src = static_cast<const uint8_t*>(tensors[t]->Data()) + r * row_stride[t];
+        if (device.type == DeviceType::kCPU) {
+          std::memcpy(dst_ptr, src, row_bytes[t]);
+        } else {
 #ifdef WITH_CUDA
-            cudaMemcpy(dst_ptr, src, row_bytes, cudaMemcpyDeviceToDevice);
+          cudaMemcpy(dst_ptr, src, row_bytes[t], cudaMemcpyDeviceToDevice);
 #endif
-          }
-          dst_ptr += row_bytes;
         }
+        dst_ptr += row_bytes[t];
       }
-    } else {
-      THROW_ERRORN("Concat: generic axis concatenation not yet implemented for these dimensions.");
+    }
+  } else {
+    // 中间维度拼接
+    // 计算内层元素数量（axis 之后的维度乘积）
+    int64_t inner_size = 1;
+    for (int i = axis + 1; i < ndim; ++i) {
+      inner_size *= base_shape[i];
+    }
+    // 计算外层块数量（axis 之前的维度乘积）
+    int64_t outer_blocks = 1;
+    for (int i = 0; i < axis; ++i) {
+      outer_blocks *= base_shape[i];
+    }
+    
+    // 计算每个 tensor 在 axis 维度的步长
+    std::vector<int64_t> axis_size(tensors.size());
+    std::vector<size_t> chunk_bytes(tensors.size());
+    for (size_t t = 0; t < tensors.size(); ++t) {
+      axis_size[t] = tensors[t]->Shape()[axis];
+      chunk_bytes[t] = axis_size[t] * inner_size * element_size;
+    }
+    
+    // 逐块拼接
+    for (int64_t outer = 0; outer < outer_blocks; ++outer) {
+      for (size_t t = 0; t < tensors.size(); ++t) {
+        size_t offset = outer * axis_size[t] * inner_size * element_size;
+        const uint8_t* src = static_cast<const uint8_t*>(tensors[t]->Data()) + offset;
+        if (device.type == DeviceType::kCPU) {
+          std::memcpy(dst_ptr, src, chunk_bytes[t]);
+        } else {
+#ifdef WITH_CUDA
+          cudaMemcpy(dst_ptr, src, chunk_bytes[t], cudaMemcpyDeviceToDevice);
+#endif
+        }
+        dst_ptr += chunk_bytes[t];
+      }
     }
   }
 
