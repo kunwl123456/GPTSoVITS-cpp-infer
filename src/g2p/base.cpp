@@ -4,18 +4,19 @@
 #include <GPTSoVITS/G2P/Base.h>
 
 #include "GPTSoVITS/G2P/g2p_zh.h"
+#include "GPTSoVITS/G2P/SymbolManager.h"
 #include "GPTSoVITS/Utils/exception.h"
-#include "GPTSovits/G2P/symbols.h"
 
 namespace GPTSoVITS::G2P {
 
 std::vector<int> cleaned_text_to_sequence(
     const std::vector<std::string>& phones) {
   std::vector<int> res;
+  auto& mgr = SymbolManager::Instance();
   for (auto& phone : phones) {
-    auto it = g_Symbols.find(phone);
-    if (it != g_Symbols.end()) {
-      res.push_back(it->second);
+    int id = mgr.FindSymbolActive(phone);
+    if (id >= 0) {
+      res.push_back(id);
     }
   }
   return res;
@@ -28,9 +29,10 @@ G2PRes IG2P::CleanText(const std::string& text) const {
   //    input += ".";
   //  }
   auto res = _cleanText(text);
+  auto& mgr = SymbolManager::Instance();
   for (auto& ph : res.phones) {
     // 检查 ph 是否在 symbols 中
-    if (g_Symbols.find(ph) == g_Symbols.end()) {
+    if (!mgr.HasSymbolActive(ph)) {
       ph = "UNK";
     }
   }

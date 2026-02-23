@@ -5,6 +5,7 @@
 #include "GPTSoVITS/PipelineBase.h"
 
 #include "GPTSoVITS/plog.h"
+#include "GPTSoVITS/G2P/SymbolManager.h"
 #include <sstream>
 #include "nlohmann/json.hpp"
 
@@ -75,14 +76,29 @@ void PipelineBase::InitializeConfig() {
     m_config_params.mel_bins = data.value<int>("mel_bins", 128);
   }
 
+  std::string version = "default";
   if (m_config->data.contains("model")) {
     auto& model = m_config->data["model"];
-    m_config_params.model_version = model.value<std::string>("version", "v2");
+    version = model.value<std::string>("version", "v2");
+    m_config_params.model_version = version;
   }
 
   if (m_config->data.contains("sv_embedding")) {
     auto& sv_emb = m_config->data["sv_embedding"];
     m_config_params.sv_dim = sv_emb.value<int>("embedding_size", 20480);
+  }
+
+  // 加载 symbol_to_id 到 SymbolManager
+  if (m_config->data.contains("symbol_to_id")) {
+    auto& sym_mgr = G2P::SymbolManager::Instance();
+    std::string sym_json = m_config->data["symbol_to_id"].dump();
+    if (sym_mgr.LoadFromJson(sym_json, version)) {
+      sym_mgr.SetActiveVersion(version);
+      PrintDebug("[PipelineBase] Loaded {} symbols for version: {}",
+                 sym_mgr.GetSymbolCount(version), version);
+    } else {
+      PrintWarn("[PipelineBase] Failed to load symbol_to_id, using default");
+    }
   }
 
   PrintDebug("[PipelineBase] Config initialized: sampling_rate={}, max_len={}, version={}",
