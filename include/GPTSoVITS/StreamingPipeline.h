@@ -16,19 +16,17 @@ namespace GPTSoVITS {
 /**
  * @brief 流推理配置
  *
- * 关键参数说明：
  * - chunk_length: 分块长度，影响流式输出粒度。较大值减少分割次数但增加首包延迟
- * - h_len: 历史token长度，用于平滑过渡。必须与Python版本一致(512)，否则会产生音频割裂
+ * - h_len: 历史token长度，用于平滑过渡。
  * - l_len: 前瞻token长度，用于平滑过渡
- * - noise_scale: 噪声缩放，影响音频多样性。推荐 0.35（与 Python 一致）
+ * - noise_scale: 噪声缩放，影响音频多样性。推荐 0.35
  *
- * 注意：mute_matrix 功能暂未实现，当前使用固定长度分割
  */
 struct StreamingConfig {
   int chunk_length = 24;          // 分块长度（token 数）
   float pause_length = 0.3f;      // 段落间停顿（秒）
   int fade_length = 1280;         // 淡入淡出长度（采样点数）
-  int h_len = 512;                // 历史token长度（用于平滑过渡），必须为512，与Python版本一致
+  int h_len = 512;                // 历史token长度（用于平滑过渡）
   int l_len = 16;                 // 前瞻token长度（用于平滑过渡）
   bool enable_fade = true;        // 是否启用淡入淡出
   bool enable_mute_matrix = false; // 是否使用静音矩阵分割（暂未实现）
@@ -178,14 +176,6 @@ private:
    * @brief 生成停顿音频
    */
   std::vector<float> GeneratePause(float duration, int sampling_rate);
-
-  /**
-   * @brief 采样top-k token
-   */
-  static int64_t SampleTopK(
-      const Model::Tensor* topk_values,
-      const Model::Tensor* topk_indices,
-      float temperature);
 };
 
 }  // namespace GPTSoVITS

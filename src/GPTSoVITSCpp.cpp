@@ -7,6 +7,8 @@
 #include <random>
 
 #include "GPTSoVITS/plog.h"
+#include "GPTSoVITS/Utils/Precision.h"
+#include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/speaker_serializer.h"
 #include "nlohmann/json.hpp"
 
@@ -78,16 +80,21 @@ GPTSoVITSPipline::GPTSoVITSPipline(
   // 初始化配置参数
   InitializeConfig();
 
+  // 更新SoVITS模型的SV维度
+  if (m_sovits_model) {
+    m_sovits_model->SetSVDim(m_config_params.sv_dim);
+  }
+
   // 检测模型精度
   DetectModelPrecision();
 
   PrintDebug("GPT-SoVITS Pipeline initialized:");
-  PrintDebug("  Model version: {}", m_model_version);
-  PrintDebug("  Sampling rate: {} Hz", m_sampling_rate);
-  PrintDebug("  Max sequence length: {}", m_max_len);
+  PrintDebug("  Model version: {}", m_config_params.model_version);
+  PrintDebug("  Sampling rate: {} Hz", m_config_params.sampling_rate);
+  PrintDebug("  Max sequence length: {}", m_config_params.max_len);
   PrintDebug("  Compute precision: {}",
             m_compute_precision == Model::DataType::kFloat16 ? "FP16" : "FP32");
-  PrintDebug("  SV embedding dim: {}", m_sv_dim);
+  PrintDebug("  SV embedding dim: {}", m_config_params.sv_dim);
 }
 
 const SpeakerInfo& GPTSoVITSPipline::CreateSpeaker(
@@ -273,7 +280,7 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     }
 
     // 准备输入时使用正确的数据类型
-    auto compute_dtype = GetComputeDataType();
+    auto compute_dtype = GetComputePrecision();
 
     if (all_bert->Type() != compute_dtype) {
       PrintDebug("  Converting bert_feature from {} to {} for GPT Encoder",
@@ -559,7 +566,7 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
 
     // 添加停顿
     if (seg_idx < segments.size() - 1) {
-      int pause_samples = static_cast<int>(m_sampling_rate * 0.3f);
+      int pause_samples = static_cast<int>(m_config_params.sampling_rate * 0.3f);
       final_audio.insert(final_audio.end(), pause_samples, 0.0f);
     }
   }
@@ -585,132 +592,20 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
 
     PrintDebug("Final audio: {} samples ({} seconds), peak amplitude: {:.4f}",
               final_audio.size(),
-              static_cast<float>(final_audio.size()) / m_sampling_rate,
+              static_cast<float>(final_audio.size()) / m_config_params.sampling_rate,
               max_amp);
 
-    return AudioTools::FromByte(final_audio,m_sampling_rate);
+    return AudioTools::FromByte(final_audio,m_config_params.sampling_rate);
   } else {
     PrintWarn("Generated empty audio");
-    return AudioTools::FromEmpty(m_sampling_rate);
+    return AudioTools::FromEmpty(m_config_params.sampling_rate);
   }
 }
 
-namespace {
-
-// Helper function to sample from top-k
-int64_t sample_top_k(const Model::Tensor* topk_values,
-                     const Model::Tensor* topk_indices, float temperature) {
-  if (!topk_values || !topk_indices || topk_values->ElementCount() == 0) {
-    return 0;
-  }
-
-  // 确保数据在CPU上且类型正确，用于采样
-  auto values_cpu = topk_values->To(Model::Device(Model::DeviceType::kCPU),
-                                     Model::DataType::kFloat32);
-  auto indices_cpu = topk_indices->To(Model::Device(Model::DeviceType::kCPU),
-                                       Model::DataType::kInt64);
-
-  auto values = values_cpu->Data<float>();
-  auto indices = indices_cpu->Data<int64_t>();
-  int k = values_cpu->ElementCount();
-
-  if (k == 0) {
-    PrintError("sample_top_k: k is zero!");
-    return 0;
-  }
-
-  // Apply temperature
-  std::vector<float> probs(values, values + k);
-  if (temperature != 1.0f && temperature > 1e-6f) {
-    for (auto& p : probs) {
-      p /= temperature;
-    }
-  }
-
-  // Find max for numerical stability
-  float max_val = *std::max_element(probs.begin(), probs.end());
-
-  // Apply softmax with numerical stability checks
-  float sum = 0.0f;
-  for (size_t i = 0; i < probs.size(); ++i) {
-    probs[i] -= max_val;  // Subtract max to avoid overflow
-
-    // Clamp to prevent exp overflow/underflow
-    if (probs[i] > 50.0f) {
-      probs[i] = 50.0f;
-    } else if (probs[i] < -50.0f) {
-      probs[i] = -50.0f;
-    }
-
-    probs[i] = std::exp(probs[i]);
-
-    // Check for NaN or Inf
-    if (!std::isfinite(probs[i])) {
-      PrintWarn("sample_top_k: Invalid exp value at index {}, resetting to 0", i);
-      probs[i] = 0.0f;
-    }
-
-    sum += probs[i];
-  }
-
-  // Normalize probabilities
-  if (sum > 1e-10f) {
-    for (auto& p : probs) {
-      p /= sum;
-    }
-  } else {
-    // Fallback: uniform distribution if sum is too small
-    PrintWarn("sample_top_k: Sum of probabilities is too small ({:.6f}), using uniform distribution", sum);
-    float uniform_prob = 1.0f / static_cast<float>(k);
-    for (auto& p : probs) {
-      p = uniform_prob;
-    }
-  }
-
-  // Validate probabilities
-  for (const auto& p : probs) {
-    if (p < 0.0f || !std::isfinite(p)) {
-      PrintError("sample_top_k: Invalid probability detected, falling back to argmax");
-      // Fallback to argmax
-      int max_idx = 0;
-      float max_prob = probs[0];
-      for (int i = 1; i < k; ++i) {
-        if (probs[i] > max_prob) {
-          max_prob = probs[i];
-          max_idx = i;
-        }
-      }
-      return indices[max_idx];
-    }
-  }
-
-  // Sample using discrete distribution
-  try {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    int choice = dist(gen);
-    return indices[choice];
-  } catch (const std::exception& e) {
-    PrintError("sample_top_k: discrete_distribution failed: {}, falling back to argmax", e.what());
-    // Fallback to argmax
-    int max_idx = 0;
-    float max_prob = probs[0];
-    for (int i = 1; i < k; ++i) {
-      if (probs[i] > max_prob) {
-        max_prob = probs[i];
-        max_idx = i;
-      }
-    }
-    return indices[max_idx];
-  }
-}
-
-}  // anonymous namespace
 int64_t GPTSoVITSPipline::SampleTopK(const Model::Tensor* topk_values,
                                      const Model::Tensor* topk_indices,
                                      float temperature) {
-  return sample_top_k(topk_values, topk_indices, temperature);
+  return Utils::SampleTopK(topk_values, topk_indices, temperature);
 }
 
 std::unique_ptr<Model::Tensor> GPTSoVITSPipline::ConcatTensor(
@@ -718,32 +613,6 @@ std::unique_ptr<Model::Tensor> GPTSoVITSPipline::ConcatTensor(
   std::vector<Model::Tensor*> tensors = {const_cast<Model::Tensor*>(a),
                                          const_cast<Model::Tensor*>(b)};
   return Model::Tensor::Concat(tensors, axis);
-}
-
-void GPTSoVITSPipline::InitializeConfig() {
-  // 从config.json读取基本参数
-  if (m_config->data.contains("data")) {
-    auto& data = m_config->data["data"];
-    m_sampling_rate = data.value<int>("sampling_rate", 32000);
-    m_max_len = data.value<int>("max_len", 1000);
-    m_hop_length = data.value<int>("hop_length", 640);
-    m_filter_length = data.value<int>("filter_length", 2048);
-  }
-
-  if (m_config->data.contains("model")) {
-    auto& model = m_config->data["model"];
-    m_model_version = model.value<std::string>("version", "v2");
-  }
-
-  if (m_config->data.contains("sv_embedding")) {
-    auto& sv_emb = m_config->data["sv_embedding"];
-    m_sv_dim = sv_emb.value<int>("embedding_size", 20480);
-  }
-
-  // 更新SoVITS模型的SV维度
-  if (m_sovits_model) {
-    m_sovits_model->SetSVDim(m_sv_dim);
-  }
 }
 
 void GPTSoVITSPipline::DetectModelPrecision() {
@@ -762,10 +631,6 @@ void GPTSoVITSPipline::DetectModelPrecision() {
     PrintWarn("Failed to detect model precision, defaulting to FP32");
     m_compute_precision = Model::DataType::kFloat32;
   }
-}
-
-Model::DataType GPTSoVITSPipline::GetComputeDataType() const {
-  return m_compute_precision;
 }
 
 // ============ 说话人数据导入/导出方法 ============
@@ -838,34 +703,6 @@ bool GPTSoVITSPipline::ImportSpeaker(const std::string& input_path,
             final_name, speaker_info->m_speaker_lang);
 
   return true;
-}
-
-std::vector<std::string> GPTSoVITSPipline::ListSpeakers() const {
-  std::vector<std::string> speaker_names;
-  speaker_names.reserve(m_speaker_map.size());
-
-  for (const auto& [name, _] : m_speaker_map) {
-    speaker_names.push_back(name);
-  }
-
-  return speaker_names;
-}
-
-bool GPTSoVITSPipline::RemoveSpeaker(const std::string& speaker_name) {
-  auto iter = m_speaker_map.find(speaker_name);
-  if (iter == m_speaker_map.end()) {
-    PrintError("[GPTSoVITSPipline] Speaker '{}' not found", speaker_name);
-    return false;
-  }
-
-  m_speaker_map.erase(iter);
-  PrintInfo("[GPTSoVITSPipline] Removed speaker: {}", speaker_name);
-
-  return true;
-}
-
-bool GPTSoVITSPipline::HasSpeaker(const std::string& speaker_name) const {
-  return m_speaker_map.find(speaker_name) != m_speaker_map.end();
 }
 
 }  // namespace GPTSoVITS

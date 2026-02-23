@@ -304,6 +304,26 @@ std::unique_ptr<Tensor> Tensor::View(const std::vector<int64_t>& new_shape) {
   return view;
 }
 
+std::unique_ptr<Tensor> Tensor::View(const std::vector<int64_t>& new_shape) const {
+  int64_t new_numel = ComputeNumel(new_shape);
+
+  // 确保View前后元素总量一致
+  if (new_numel != numel_) {
+    THROW_ERRORN("View failed: element count mismatch.");
+  }
+
+  // 创建视图，共享底层内存
+  // const 版本：data_ptr_ 是 mutable 或通过 get() 获取原始指针
+  auto view = std::make_unique<Tensor>(
+      data_ptr_.get(),
+      new_shape,
+      dtype_,
+      device_,
+      [](void*) {});  // 空 deleter
+
+  return view;
+}
+
 std::unique_ptr<Tensor> Tensor::Slice(int64_t start, int64_t end, int axis) {
   if (axis < 0 || axis >= static_cast<int>(shape_.size())) {
     THROW_ERRORN("Slice: axis out of range.");
@@ -340,6 +360,53 @@ std::unique_ptr<Tensor> Tensor::Slice(int64_t start, int64_t end, int axis) {
   } else {
     // 在 GPU 上，需要创建新的 Tensor 并拷贝数据
     // （因为需要维护正确的内存管理）
+    auto sliced = Empty(new_shape, dtype_, device_);
+    size_t copy_size = static_cast<size_t>(ComputeNumel(new_shape)) * element_size;
+#ifdef WITH_CUDA
+    cudaMemcpy(sliced->Data(), data_ptr, copy_size, cudaMemcpyDeviceToDevice);
+#else
+    THROW_ERRORN("Slice on CUDA not available without CUDA support.");
+#endif
+    return sliced;
+  }
+}
+
+std::unique_ptr<Tensor> Tensor::Slice(int64_t start, int64_t end, int axis) const {
+  if (axis < 0 || axis >= static_cast<int>(shape_.size())) {
+    THROW_ERRORN("Slice: axis out of range.");
+  }
+  if (start < 0) start += shape_[axis];
+  if (end < 0) end += shape_[axis];
+  if (start < 0 || end > shape_[axis] || start >= end) {
+    THROW_ERRORN("Slice: invalid start/end indices.");
+  }
+
+  // 计算切片后的形状
+  std::vector<int64_t> new_shape = shape_;
+  new_shape[axis] = end - start;
+
+  // 计算数据偏移
+  size_t element_size = ElementSize(dtype_);
+  int64_t offset = start;
+
+  // 计算该维度之前的元素总数
+  for (int i = axis + 1; i < static_cast<int>(shape_.size()); ++i) {
+    offset *= shape_[i];
+  }
+
+  // const 版本：通过 shared_ptr 获取原始指针
+  uint8_t* data_ptr = static_cast<uint8_t*>(data_ptr_.get()) + offset * element_size;
+
+  // 如果是在 CPU 上，可以使用零拷贝视图
+  if (device_.type == DeviceType::kCPU) {
+    return std::make_unique<Tensor>(
+        data_ptr,
+        new_shape,
+        dtype_,
+        device_,
+        [](void*) {});  // 空 deleter，视图不管理内存
+  } else {
+    // 在 GPU 上，需要创建新的 Tensor 并拷贝数据
     auto sliced = Empty(new_shape, dtype_, device_);
     size_t copy_size = static_cast<size_t>(ComputeNumel(new_shape)) * element_size;
 #ifdef WITH_CUDA

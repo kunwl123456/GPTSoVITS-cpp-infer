@@ -16,6 +16,8 @@
 #include "GPTSoVITS/G2P/G2P_Zh.h"
 #include "GPTSoVITS/G2P/Pipline.h"
 #include "GPTSoVITS/Text/Sentence.h"
+#include "GPTSoVITS/Utils/Precision.h"
+#include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/speaker_serializer.h"
 #include "GPTSoVITS/model/CNBertModel.h"
 #include "GPTSoVITS/model/backend/onnx_backend.h"
@@ -360,9 +362,9 @@ public:
       }
     }
     // 采样第一个 token
-    int64_t first_token = SampleTopK(encoder_output.topk_values.get(),
-                                     encoder_output.topk_indices.get(),
-                                     sample_config.temperature);
+    int64_t first_token = Utils::SampleTopK(encoder_output.topk_values.get(),
+                                            encoder_output.topk_indices.get(),
+                                            sample_config.temperature);
     PrintDebug("[InferencePipeline] First sampled token: {}", first_token);
     // 准备 GPT Step 循环
     auto current_samples = Model::Tensor::Empty({1, 1}, Model::DataType::kInt64,
@@ -435,8 +437,8 @@ public:
       v_cache = std::move(step_output.v_cache_new);
       // 采样
       int64_t next_token =
-          SampleTopK(step_output.topk_values.get(),
-                     step_output.topk_indices.get(), sample_config.temperature);
+          Utils::SampleTopK(step_output.topk_values.get(),
+                            step_output.topk_indices.get(), sample_config.temperature);
       // 检查 token 有效性
       if (next_token < 0 || next_token > eos_token) {
         PrintWarn(
@@ -625,111 +627,6 @@ public:
       }
     }
     return AudioTools::FromByte(audio_data, sampling_rate);
-  }
-  // Top-K 采样
-  static int64_t SampleTopK(const Model::Tensor* topk_values,
-                            const Model::Tensor* topk_indices,
-                            float temperature) {
-    if (!topk_values || !topk_indices || topk_values->ElementCount() == 0) {
-      PrintError("[InferencePipeline] SampleTopK: invalid input");
-      return 0;
-    }
-    auto values_cpu = topk_values->To(Model::Device(Model::DeviceType::kCPU),
-                                      Model::DataType::kFloat32);
-    auto indices_cpu = topk_indices->To(Model::Device(Model::DeviceType::kCPU),
-                                        Model::DataType::kInt64);
-    const float* values = values_cpu->Data<float>();
-    const int64_t* indices = indices_cpu->Data<int64_t>();
-    int k = values_cpu->ElementCount();
-    if (k == 0) {
-      PrintError("[InferencePipeline] SampleTopK: k is zero!");
-      return 0;
-    }
-    // 应用温度
-    std::vector<float> probs(values, values + k);
-    if (temperature != 1.0f && temperature > 1e-6f) {
-      for (auto& p : probs) {
-        p /= temperature;
-      }
-    }
-    // Softmax
-    float max_val = *std::max_element(probs.begin(), probs.end());
-    float sum = 0.0f;
-    for (size_t i = 0; i < probs.size(); ++i) {
-      probs[i] -= max_val;  // 减去最大值防止溢出
-      // Clamp 防止 exp 溢出/下溢
-      if (probs[i] > 50.0f) {
-        probs[i] = 50.0f;
-      } else if (probs[i] < -50.0f) {
-        probs[i] = -50.0f;
-      }
-      probs[i] = std::exp(probs[i]);
-      // 检查 NaN/Inf
-      if (!std::isfinite(probs[i])) {
-        PrintWarn(
-            "[InferencePipeline] SampleTopK: Invalid exp value at index {}, "
-            "resetting to 0",
-            i);
-        probs[i] = 0.0f;
-      }
-      sum += probs[i];
-    }
-    // 归一化
-    if (sum > 1e-10f) {
-      for (auto& p : probs) {
-        p /= sum;
-      }
-    } else {
-      // 均匀分布
-      PrintWarn(
-          "[InferencePipeline] SampleTopK: Sum of probabilities is too small "
-          "({:.6f}), using uniform distribution",
-          sum);
-      float uniform_prob = 1.0f / static_cast<float>(k);
-      for (auto& p : probs) {
-        p = uniform_prob;
-      }
-    }
-    // 验证概率
-    for (const auto& p : probs) {
-      if (p < 0.0f || !std::isfinite(p)) {
-        PrintError(
-            "[InferencePipeline] SampleTopK: Invalid probability detected, "
-            "falling back to argmax");
-        // Fallback to argmax
-        int max_idx = 0;
-        float max_prob = probs[0];
-        for (int i = 1; i < k; ++i) {
-          if (probs[i] > max_prob) {
-            max_prob = probs[i];
-            max_idx = i;
-          }
-        }
-        return indices[max_idx];
-      }
-    }
-    // 采样
-    try {
-      std::random_device rd;
-      std::mt19937 gen(rd());
-      std::discrete_distribution<int> dist(probs.begin(), probs.end());
-      return indices[dist(gen)];
-    } catch (const std::exception& e) {
-      PrintError(
-          "[InferencePipeline] SampleTopK: discrete_distribution failed: {}, "
-          "falling back to argmax",
-          e.what());
-      // Fallback to argmax
-      int max_idx = 0;
-      float max_prob = probs[0];
-      for (int i = 1; i < k; ++i) {
-        if (probs[i] > max_prob) {
-          max_prob = probs[i];
-          max_idx = i;
-        }
-      }
-      return indices[max_idx];
-    }
   }
 };
 InferencePipeline::InferencePipeline(const PipelineConfig& config)
@@ -1140,7 +1037,7 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
     auto encoder_output =
         gpt_encoder->Encode(phoneme_ids.get(), prompts.get(), all_bert.get());
     // 采样第一个 token
-    int64_t first_token = impl_->SampleTopK(encoder_output.topk_values.get(),
+    int64_t first_token = Utils::SampleTopK(encoder_output.topk_values.get(),
                                             encoder_output.topk_indices.get(),
                                             sample_config.temperature);
     // 创建第一个 token tensor
@@ -1289,7 +1186,7 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       }
       consecutive_invalid_count = 0;
       // 采样下一个 token
-      int64_t next_token = impl_->SampleTopK(step_output.topk_values.get(),
+      int64_t next_token = Utils::SampleTopK(step_output.topk_values.get(),
                                              step_output.topk_indices.get(),
                                              sample_config.temperature);
       // 检查 EOS

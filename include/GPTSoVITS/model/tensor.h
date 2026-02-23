@@ -1,4 +1,4 @@
-#ifndef GPT_SOVITS_CPP_TENSOR_H
+﻿#ifndef GPT_SOVITS_CPP_TENSOR_H
 #define GPT_SOVITS_CPP_TENSOR_H
 
 #include <functional>
@@ -82,6 +82,14 @@ public:
   std::unique_ptr<Tensor> View(const std::vector<int64_t>& new_shape);
 
   /**
+   * @brief 创建 Tensor 的零拷贝视图 (const 版本)
+   * @param new_shape 新的形状
+   * @return 视图 Tensor（共享底层内存）
+   * @note 视图不管理内存生命周期，使用需谨慎
+   */
+  std::unique_ptr<Tensor> View(const std::vector<int64_t>& new_shape) const;
+
+  /**
    * @brief 切片操作（尽可能零拷贝）
    * @param start 起始索引
    * @param end 结束索引
@@ -89,6 +97,15 @@ public:
    * @return 切片后的 Tensor
    */
   std::unique_ptr<Tensor> Slice(int64_t start, int64_t end, int axis = 0);
+
+  /**
+   * @brief 切片操作 (const 版本)
+   * @param start 起始索引
+   * @param end 结束索引
+   * @param axis 切片维度
+   * @return 切片后的 Tensor
+   */
+  std::unique_ptr<Tensor> Slice(int64_t start, int64_t end, int axis = 0) const;
 
   /**
    * @brief 填充操作

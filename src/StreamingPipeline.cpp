@@ -11,6 +11,9 @@
 
 #include "GPTSoVITS/GPTSoVITSCpp.h"
 #include "GPTSoVITS/Text/Sentence.h"
+#include "GPTSoVITS/Utils/Precision.h"
+#include "GPTSoVITS/Utils/Sampling.h"
+#include "GPTSoVITS/Utils/TensorOps.h"
 #include "GPTSoVITS/model/sample_config.h"
 #include "GPTSoVITS/model/tensor.h"
 #include "GPTSoVITS/plog.h"
@@ -156,14 +159,14 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   auto ref_phones = speaker_info.m_bert_res->PhoneSeq;
   auto target_phones_final = target_phones_tensor->To(target_device, phone_dtype);
   auto ref_phones_final = ref_phones->To(target_device, phone_dtype);
-  auto all_phones = EdgePipeline::ConcatTensor(ref_phones_final.get(), target_phones_final.get(), 0);
+  auto all_phones = Utils::ConcatTensors(ref_phones_final.get(), target_phones_final.get(), 0);
 
   // 拼接参考和目标的 BERT 特征
   auto ref_bert = speaker_info.m_bert_res->BertSeq;
   auto target_bert = target_bert_res->BertSeq;
   auto ref_bert_final = ref_bert->To(target_device, bert_dtype);
   auto target_bert_final = target_bert->To(target_device, bert_dtype);
-  auto all_bert = EdgePipeline::ConcatTensor(ref_bert_final.get(), target_bert_final.get(), 1);
+  auto all_bert = Utils::ConcatTensors(ref_bert_final.get(), target_bert_final.get(), 1);
 
   // 扩展维度(1, 1024, total_seq_len)
   auto all_bert_expanded = all_bert->View({1, all_bert->Shape()[0], all_bert->Shape()[1]});
@@ -193,7 +196,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   }
 
   // 采样第一个 token
-  int64_t first_token = SampleTopK(
+  int64_t first_token = Utils::SampleTopK(
       encoder_output.topk_values.get(),
       encoder_output.topk_indices.get(),
       temperature);
@@ -372,7 +375,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     consecutive_invalid_count = 0;
 
     // 采样下一个 token
-    int64_t next_token = SampleTopK(
+    int64_t next_token = Utils::SampleTopK(
         step_output.topk_values.get(),
         step_output.topk_indices.get(),
         temperature);
@@ -677,105 +680,6 @@ std::vector<float> StreamingPipeline::DecodeChunk(
   PrintDebug("[StreamingPipeline::DecodeChunk] result size: {}", result.size());
 
   return result;
-}
-
-int64_t StreamingPipeline::SampleTopK(
-    const Model::Tensor* topk_values,
-    const Model::Tensor* topk_indices,
-    float temperature) {
-  if (!topk_values || !topk_indices || topk_values->ElementCount() == 0) {
-    PrintError("[StreamingPipeline::SampleTopK] Invalid input: null or empty tensor");
-    return 0;
-  }
-
-  std::unique_ptr<Model::Tensor> values_cpu;
-  if (topk_values->Type() == Model::DataType::kFloat32) {
-    values_cpu = topk_values->IsCPU() ? topk_values->Clone() : topk_values->ToCPU();
-  } else {
-    // 非 float32 类型需要先转 CPU 再转 float32
-    values_cpu = topk_values->IsCPU() 
-        ? topk_values->ToType(Model::DataType::kFloat32)
-        : topk_values->ToCPU()->ToType(Model::DataType::kFloat32);
-  }
-
-  auto indices_cpu = topk_indices->IsCPU() ? 
-      topk_indices->Clone() : topk_indices->ToCPU();
-
-  int64_t k = values_cpu->ElementCount();
-  const float* values_ptr = values_cpu->Data<float>();
-  const int64_t* indices_ptr = indices_cpu->Data<int64_t>();
-
-  // 检查温度参数有效性
-  if (temperature <= 1e-6f) {
-    PrintWarn("[StreamingPipeline::SampleTopK] Temperature too small: {}, using 1.0", temperature);
-    temperature = 1.0f;
-  }
-
-  // 参考 Python 的 softmax 实现
-  // 先减最大值，再 exp
-  // topk_values = topk_values - np.max(topk_values, axis=-1, keepdims=True)
-  //         probs = np.exp(topk_values)
-  
-  // 找最大值（用于数值稳定性）
-  float max_val = values_ptr[0];
-  for (int i = 1; i < k; ++i) {
-    if (values_ptr[i] > max_val) max_val = values_ptr[i];
-  }
-
-  // 应用温度并计算 softmax，参考 Python 实现
-  std::vector<float> probs(static_cast<size_t>(k));
-  float sum = 0.0f;
-  
-  for (int i = 0; i < k; ++i) {
-    float logit = (values_ptr[i] - max_val) / temperature;
-    
-    // 防止 exp 溢出
-    // 当 logit < -88 时 exp 结果为 0，logit > 88 时可能溢出
-    if (logit < -88.0f) {
-      probs[i] = 0.0f;
-    } else if (logit > 88.0f) {
-      // 溢出时截断
-      probs[i] = std::exp(88.0f);  // ~1.65e38，在 float32 范围内
-    } else {
-      probs[i] = std::exp(logit);
-    }
-    
-    sum += probs[i];
-  }
-
-  // 归一化
-  if (sum > 1e-10f) {
-    for (int i = 0; i < k; ++i) {
-      probs[i] /= sum;
-    }
-  } else {
-    // 所有概率都接近0时，使用均匀分布（fallback）
-    float uniform_prob = 1.0f / static_cast<float>(k);
-    for (int i = 0; i < k; ++i) {
-      probs[i] = uniform_prob;
-    }
-  }
-
-  // 多项式采样
-  try {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    int choice = dist(gen);
-    return indices_ptr[choice];
-  } catch (const std::exception& e) {
-    PrintError("[StreamingPipeline::SampleTopK] discrete_distribution failed: {}", e.what());
-    // Fallback to argmax
-    int max_idx = 0;
-    float max_prob = probs[0];
-    for (int i = 1; i < k; ++i) {
-      if (probs[i] > max_prob) {
-        max_prob = probs[i];
-        max_idx = i;
-      }
-    }
-    return indices_ptr[max_idx];
-  }
 }
 
 std::vector<float> StreamingPipeline::ApplyFade(

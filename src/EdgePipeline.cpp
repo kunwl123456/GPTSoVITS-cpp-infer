@@ -6,20 +6,20 @@
 
 #include <algorithm>
 #include <numeric>
-#include <random>
 
+#include "GPTSoVITS/Utils/Precision.h"
+#include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/speaker_serializer.h"
+#include "GPTSoVITS/Utils/TensorOps.h"
 #include "GPTSoVITS/model/sample_config.h"
 #include "GPTSoVITS/plog.h"
 #include "nlohmann/json.hpp"
 
 namespace GPTSoVITS {
-
 class _JsonImpl {
 public:
   nlohmann::json data;
 };
-
 EdgePipeline::EdgePipeline(
     const std::string& config,
     const std::string& model_path,
@@ -34,17 +34,22 @@ EdgePipeline::EdgePipeline(
   m_config = std::make_shared<_JsonImpl>();
   m_config->data = nlohmann::json::parse(config);
 
-  // 初始化配置参数
+  // 初始化配置参数（基类方法）
   InitializeConfig();
+
+  // 设置 SoVITS 模型的 SV 维度
+  if (m_sovits_model) {
+    m_sovits_model->SetSVDim(m_config_params.sv_dim);
+  }
 
   PrintInfo("[EdgePipeline] Initialized with minimum model set:");
   PrintInfo("  Model path: {}", model_path);
-  PrintInfo("  Model version: {}", m_model_version);
-  PrintInfo("  Sampling rate: {} Hz", m_sampling_rate);
-  PrintInfo("  Max sequence length: {}", m_max_len);
+  PrintInfo("  Model version: {}", m_config_params.model_version);
+  PrintInfo("  Sampling rate: {} Hz", m_config_params.sampling_rate);
+  PrintInfo("  Max sequence length: {}", m_config_params.max_len);
   PrintInfo("  Compute precision: {}",
             m_compute_precision == Model::DataType::kFloat16 ? "FP16" : "FP32");
-  PrintInfo("  SV embedding dim: {}", m_sv_dim);
+  PrintInfo("  SV embedding dim: {}", m_config_params.sv_dim);
 }
 
 bool EdgePipeline::ImportSpeaker(const std::string& input_path,
@@ -183,7 +188,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     // 转换到统一的类型和设备
     auto ref_phones_final = ref_phones->To(target_device, phone_dtype);
     auto target_phones_final = target_phones->To(target_device, phone_dtype);
-    auto all_phones = ConcatTensor(ref_phones_final.get(), target_phones_final.get(), 0);
+    auto all_phones = Utils::ConcatTensors(ref_phones_final.get(), target_phones_final.get(), 0);
 
     // 拼接参考和目标的 BERT 特征 - 确保类型和设备一致
     // BertSeq 形状为 (1024, seq_len)，在 axis=1 上拼接
@@ -193,7 +198,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     // 转换到统一的类型和设备
     auto ref_bert_final = ref_bert->To(target_device, bert_dtype);
     auto target_bert_final = target_bert->To(target_device, bert_dtype);
-    auto all_bert = ConcatTensor(ref_bert_final.get(), target_bert_final.get(), 1);
+    auto all_bert = Utils::ConcatTensors(ref_bert_final.get(), target_bert_final.get(), 1);
 
     // 扩展维度为 (1, 1024, total_seq_len)
     if (all_bert->Shape().size() == 2) {
@@ -201,7 +206,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     }
 
     // 确保 bert_feature 类型与模型期望的计算精度一致
-    auto compute_dtype = GetComputeDataType();
+    auto compute_dtype = GetComputePrecision();
     if (all_bert->Type() != compute_dtype) {
       PrintDebug("[EdgePipeline] Converting bert_feature from {} to {} for GPT Encoder",
                 all_bert->Type() == Model::DataType::kFloat32 ? "float32" : "float16",
@@ -230,7 +235,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
         all_bert_expanded.get());
 
     // 采样第一个 token
-    int64_t first_token = SampleTopK(
+    int64_t first_token = Utils::SampleTopK(
         encoder_output.topk_values.get(),
         encoder_output.topk_indices.get(),
         sample_config.temperature);
@@ -327,7 +332,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
       consecutive_invalid_count = 0;
 
       // 采样下一个 token
-      int64_t next_token = SampleTopK(
+      int64_t next_token = Utils::SampleTopK(
           step_output.topk_values.get(),
           step_output.topk_indices.get(),
           sample_config.temperature);
@@ -364,7 +369,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     // 检查是否有生成的 tokens
     if (generated_tokens_list.empty()) {
       PrintWarn("[EdgePipeline] No tokens generated, returning empty audio");
-      return AudioTools::FromByte({}, m_sampling_rate);
+      return AudioTools::FromByte({}, m_config_params.sampling_rate);
     }
 
     // 拼接所有生成的语义 tokens (在 axis=1 上拼接)
@@ -444,376 +449,22 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
   }
 
   // 创建 AudioTools 对象
-  auto result = AudioTools::FromByte(audio_result, m_sampling_rate);
+  auto result = AudioTools::FromByte(audio_result, m_config_params.sampling_rate);
 
   return result;
-}
-
-std::vector<std::string> EdgePipeline::ListSpeakers() const {
-  std::vector<std::string> speaker_names;
-  speaker_names.reserve(m_speaker_map.size());
-
-  for (const auto& [name, _] : m_speaker_map) {
-    speaker_names.push_back(name);
-  }
-
-  return speaker_names;
-}
-
-bool EdgePipeline::RemoveSpeaker(const std::string& speaker_name) {
-  auto iter = m_speaker_map.find(speaker_name);
-  if (iter == m_speaker_map.end()) {
-    PrintError("[EdgePipeline] Speaker '{}' not found", speaker_name);
-    return false;
-  }
-
-  m_speaker_map.erase(iter);
-  PrintInfo("[EdgePipeline] Removed speaker: {}", speaker_name);
-
-  return true;
-}
-
-bool EdgePipeline::HasSpeaker(const std::string& speaker_name) const {
-  return m_speaker_map.find(speaker_name) != m_speaker_map.end();
-}
-
-const SpeakerInfo* EdgePipeline::GetSpeakerInfo(const std::string& speaker_name) const {
-  auto iter = m_speaker_map.find(speaker_name);
-  if (iter != m_speaker_map.end()) {
-    return &iter->second;
-  }
-  return nullptr;
 }
 
 std::string EdgePipeline::GetModelInfo() const {
   std::ostringstream oss;
   oss << "EdgePipeline Info:\n";
-  oss << "  Model version: " << m_model_version << "\n";
-  oss << "  Sampling rate: " << m_sampling_rate << " Hz\n";
-  oss << "  Max sequence length: " << m_max_len << "\n";
+  oss << "  Model version: " << m_config_params.model_version << "\n";
+  oss << "  Sampling rate: " << m_config_params.sampling_rate << " Hz\n";
+  oss << "  Max sequence length: " << m_config_params.max_len << "\n";
   oss << "  Compute precision: "
       << (m_compute_precision == Model::DataType::kFloat16 ? "FP16" : "FP32") << "\n";
-  oss << "  SV embedding dim: " << m_sv_dim << "\n";
+  oss << "  SV embedding dim: " << m_config_params.sv_dim << "\n";
   oss << "  Loaded speakers: " << m_speaker_map.size() << "\n";
   return oss.str();
-}
-
-// ============ Helper Methods ============
-
-int64_t EdgePipeline::SampleTopK(const Model::Tensor* topk_values,
-                                  const Model::Tensor* topk_indices,
-                                  float temperature) {
-  // 空指针检查
-  if (!topk_values || !topk_indices || topk_values->ElementCount() == 0) {
-    PrintError("[EdgePipeline] SampleTopK: invalid input (null or empty)");
-    return 0;
-  }
-
-  // 确保在 CPU 上并转换为正确类型
-  auto values_cpu = topk_values->To(Model::Device(Model::DeviceType::kCPU),
-                                     Model::DataType::kFloat32);
-  auto indices_cpu = topk_indices->To(Model::Device(Model::DeviceType::kCPU),
-                                       Model::DataType::kInt64);
-
-  const float* values_ptr = values_cpu->Data<float>();
-  const int64_t* indices_ptr = indices_cpu->Data<int64_t>();
-  int k = values_cpu->ElementCount();
-
-  if (k == 0) {
-    PrintError("[EdgePipeline] SampleTopK: k is zero!");
-    return 0;
-  }
-
-  // 应用温度
-  std::vector<float> probs(values_ptr, values_ptr + k);
-  if (temperature != 1.0f && temperature > 1e-6f) {
-    for (auto& p : probs) {
-      p /= temperature;
-    }
-  }
-
-  // 检查 NaN/Inf
-  bool has_invalid = false;
-  for (int i = 0; i < k; ++i) {
-    if (!std::isfinite(probs[i])) {
-      has_invalid = true;
-      break;
-    }
-  }
-  if (has_invalid) {
-    PrintError("[EdgePipeline] SampleTopK: input contains NaN/Inf, returning first index");
-    return indices_ptr[0];
-  }
-
-  // 找最大值用于数值稳定性
-  float max_val = *std::max_element(probs.begin(), probs.end());
-
-  // Apply softmax with numerical stability
-  float sum = 0.0f;
-  for (size_t i = 0; i < probs.size(); ++i) {
-    probs[i] -= max_val;
-
-    // Clamp 防止 exp 溢出
-    if (probs[i] > 50.0f) {
-      probs[i] = 50.0f;
-    } else if (probs[i] < -50.0f) {
-      probs[i] = -50.0f;
-    }
-
-    probs[i] = std::exp(probs[i]);
-
-    if (!std::isfinite(probs[i])) {
-      PrintWarn("[EdgePipeline] SampleTopK: Invalid exp value at index {}, resetting to 0", i);
-      probs[i] = 0.0f;
-    }
-
-    sum += probs[i];
-  }
-
-  // 归一化
-  if (sum > 1e-10f) {
-    for (auto& p : probs) {
-      p /= sum;
-    }
-  } else {
-    PrintWarn("[EdgePipeline] SampleTopK: Sum too small ({:.6f}), using uniform", sum);
-    float uniform_prob = 1.0f / static_cast<float>(k);
-    for (auto& p : probs) {
-      p = uniform_prob;
-    }
-  }
-
-  // 多项式采样
-  try {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    int choice = dist(gen);
-    return indices_ptr[choice];
-  } catch (const std::exception& e) {
-    PrintError("[EdgePipeline] SampleTopK: discrete_distribution failed: {}, using argmax", e.what());
-    // Fallback to argmax
-    int max_idx = 0;
-    float max_prob = probs[0];
-    for (int i = 1; i < k; ++i) {
-      if (probs[i] > max_prob) {
-        max_prob = probs[i];
-        max_idx = i;
-      }
-    }
-    return indices_ptr[max_idx];
-  }
-}
-
-int64_t EdgePipeline::SampleWithConfig(const Model::Tensor* topk_values,
-                                       const Model::Tensor* topk_indices,
-                                       const Model::SampleConfig& config) const {
-  // 目前只支持基于 topk_values 和 topk_indices 的采样
-  return SampleTopK(topk_values, topk_indices, config.temperature);
-}
-
-int64_t EdgePipeline::SampleTopKWithConfig(const Model::Tensor* logits,
-                                            const Model::SampleConfig& config) {
-  // 验证配置
-  if (!config.Validate()) {
-    PrintError("[EdgePipeline] Invalid sample config");
-    return 0;
-  }
-
-  // 确保在 CPU 上
-  auto logits_cpu = logits->IsCPU() ? logits->Clone() : logits->ToCPU();
-
-  // 获取词汇表大小
-  int64_t vocab_size = logits_cpu->Shape()[logits_cpu->Shape().size() - 1];
-  const float* logits_ptr = logits_cpu->Data<float>();
-
-  std::vector<float> probs(static_cast<size_t>(vocab_size));
-  float max_val = *std::max_element(logits_ptr, logits_ptr + static_cast<size_t>(vocab_size));
-  float sum = 0.0f;
-  for (int64_t i = 0; i < vocab_size; ++i) {
-    probs[static_cast<size_t>(i)] = std::exp((logits_ptr[static_cast<size_t>(i)] - max_val) / config.temperature);
-    sum += probs[static_cast<size_t>(i)];
-  }
-
-  // 归一化
-  for (int64_t i = 0; i < vocab_size; ++i) {
-    probs[static_cast<size_t>(i)] /= sum;
-  }
-
-  // Top-K 筛选
-  if (config.UseTopK()) {
-    int64_t k = std::min(static_cast<int64_t>(config.top_k), vocab_size);
-
-    // 创建索引数组并排序
-    std::vector<int64_t> indices(static_cast<size_t>(vocab_size));
-    for (int64_t i = 0; i < vocab_size; ++i) {
-      indices[static_cast<size_t>(i)] = i;
-    }
-
-    std::partial_sort(indices.begin(), indices.begin() + static_cast<ptrdiff_t>(k), indices.end(),
-                      [&probs](int64_t a, int64_t b) { return probs[static_cast<size_t>(a)] > probs[static_cast<size_t>(b)]; });
-
-    // 只保留 top-k 的概率
-    std::vector<float> filtered_probs(static_cast<size_t>(k));
-    std::vector<int64_t> filtered_indices(static_cast<size_t>(k));
-    float filtered_sum = 0.0f;
-    for (int64_t i = 0; i < k; ++i) {
-      filtered_probs[static_cast<size_t>(i)] = probs[static_cast<size_t>(indices[static_cast<size_t>(i)])];
-      filtered_indices[static_cast<size_t>(i)] = indices[static_cast<size_t>(i)];
-      filtered_sum += filtered_probs[static_cast<size_t>(i)];
-    }
-
-    // 重新归一化
-    for (int64_t i = 0; i < k; ++i) {
-      filtered_probs[static_cast<size_t>(i)] /= filtered_sum;
-    }
-
-    // Top-P (nucleus) 筛选
-    if (config.UseTopP()) {
-      // 按概率排序
-      std::vector<int64_t> order(static_cast<size_t>(k));
-      for (int64_t i = 0; i < k; ++i) {
-        order[static_cast<size_t>(i)] = i;
-      }
-      std::sort(order.begin(), order.end(),
-                [&filtered_probs](int64_t a, int64_t b) { return filtered_probs[static_cast<size_t>(a)] > filtered_probs[static_cast<size_t>(b)]; });
-
-      // 找到累积概率达到 top_p 的最小集合
-      float cumulative = 0.0f;
-      int64_t cutoff = k;
-      for (int64_t i = 0; i < k; ++i) {
-        cumulative += filtered_probs[static_cast<size_t>(order[static_cast<size_t>(i)])];
-        if (cumulative >= config.top_p) {
-          cutoff = i + 1;
-          break;
-        }
-      }
-
-      // 只保留前 cutoff 个
-      if (cutoff < k) {
-        filtered_probs.resize(cutoff);
-        filtered_indices.resize(cutoff);
-        // 重新归一化
-        float new_sum = 0.0f;
-        for (int i = 0; i < cutoff; ++i) {
-          new_sum += filtered_probs[i];
-        }
-        for (int i = 0; i < cutoff; ++i) {
-          filtered_probs[i] /= new_sum;
-        }
-      }
-    }
-
-    // 多项式采样
-    float r = static_cast<float>(rand()) / RAND_MAX;
-    float cumulative = 0.0f;
-    for (size_t i = 0; i < filtered_probs.size(); ++i) {
-      cumulative += filtered_probs[i];
-      if (r <= cumulative) {
-        return filtered_indices[i];
-      }
-    }
-
-    return filtered_indices.back();
-  } else {
-    // 没有使用 Top-K，直接应用 Top-P
-    if (config.UseTopP()) {
-      // 按概率排序
-      std::vector<int64_t> indices(static_cast<size_t>(vocab_size));
-      for (int64_t i = 0; i < vocab_size; ++i) {
-        indices[static_cast<size_t>(i)] = i;
-      }
-      std::sort(indices.begin(), indices.end(),
-                [&probs](int64_t a, int64_t b) { return probs[static_cast<size_t>(a)] > probs[static_cast<size_t>(b)]; });
-
-      // 找到累积概率达到 top_p 的最小集合
-      float cumulative = 0.0f;
-      int64_t cutoff = vocab_size;
-      for (int64_t i = 0; i < vocab_size; ++i) {
-        cumulative += probs[static_cast<size_t>(indices[static_cast<size_t>(i)])];
-        if (cumulative >= config.top_p) {
-          cutoff = i + 1;
-          break;
-        }
-      }
-
-      // 只采样前 cutoff 个
-      std::vector<float> filtered_probs(cutoff);
-      for (int i = 0; i < cutoff; ++i) {
-        filtered_probs[i] = probs[indices[i]];
-      }
-
-      // 重新归一化
-      float filtered_sum = 0.0f;
-      for (int i = 0; i < cutoff; ++i) {
-        filtered_sum += filtered_probs[i];
-      }
-      for (int i = 0; i < cutoff; ++i) {
-        filtered_probs[i] /= filtered_sum;
-      }
-
-      // 多项式采样
-      float r = static_cast<float>(rand()) / RAND_MAX;
-      cumulative = 0.0f;
-      for (int i = 0; i < cutoff; ++i) {
-        cumulative += filtered_probs[i];
-        if (r <= cumulative) {
-          return indices[i];
-        }
-      }
-
-      return indices[cutoff - 1];
-    } else {
-      // 没有任何筛选，直接采样
-      float r = static_cast<float>(rand()) / RAND_MAX;
-      float cumulative = 0.0f;
-      for (int64_t i = 0; i < vocab_size; ++i) {
-        cumulative += probs[static_cast<size_t>(i)];
-        if (r <= cumulative) {
-          return i;
-        }
-      }
-
-      return vocab_size - 1;
-    }
-  }
-}
-
-std::unique_ptr<Model::Tensor> EdgePipeline::ConcatTensor(
-    const Model::Tensor* a, const Model::Tensor* b, int axis) {
-  std::vector<Model::Tensor*> tensors = {
-      const_cast<Model::Tensor*>(a),
-      const_cast<Model::Tensor*>(b)
-  };
-  return Model::Tensor::Concat(tensors, axis);
-}
-
-void EdgePipeline::InitializeConfig() {
-  if (m_config->data.contains("data")) {
-    auto& data = m_config->data["data"];
-    m_sampling_rate = data.value<int>("sampling_rate", 32000);
-    m_max_len = data.value<int>("max_len", 1000);
-    m_hop_length = data.value<int>("hop_length", 640);
-    m_filter_length = data.value<int>("filter_length", 2048);
-  }
-
-  if (m_config->data.contains("model")) {
-    auto& model = m_config->data["model"];
-    m_model_version = model.value<std::string>("version", "v2");
-  }
-
-  if (m_config->data.contains("sv_embedding")) {
-    auto& sv_emb = m_config->data["sv_embedding"];
-    m_sv_dim = sv_emb.value<int>("embedding_size", 20480);
-  }
-
-  if (m_sovits_model) {
-    m_sovits_model->SetSVDim(m_sv_dim);
-  }
-}
-
-Model::DataType EdgePipeline::GetComputeDataType() const {
-  return m_compute_precision;
 }
 
 }  // namespace GPTSoVITS
