@@ -8,6 +8,7 @@
 #include <cmath>
 #include <numeric>
 #include <random>
+#include <utility>
 
 #include "GPTSoVITS/GPTSoVITSCpp.h"
 #include "GPTSoVITS/Text/Sentence.h"
@@ -25,7 +26,7 @@ namespace GPTSoVITS {
 StreamingPipeline::StreamingPipeline(
     std::shared_ptr<EdgePipeline> edge_pipeline,
     const StreamingConfig& config)
-    : m_edge_pipeline(edge_pipeline), m_config(config) {
+    : m_edge_pipeline(std::move(edge_pipeline)), m_config(config) {
   PrintInfo("[StreamingPipeline] Initialized with config:");
   PrintInfo("  chunk_length: {}", m_config.chunk_length);
   PrintInfo("  pause_length: {}s", m_config.pause_length);
@@ -258,10 +259,12 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
 
   // 预分配 topk 输出缓冲区
   int top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
+  auto topk_val_dtype = gpt_step_model->GetModel()->GetOutputDataType("topk_values");
+  auto topk_idx_dtype = gpt_step_model->GetModel()->GetOutputDataType("topk_indices");
   auto topk_values_buf = Model::Tensor::Empty(
-      {1, top_k}, Model::DataType::kFloat32, Model::DeviceType::kCPU);
+      {1, top_k}, topk_val_dtype, Model::DeviceType::kCPU);
   auto topk_indices_buf = Model::Tensor::Empty(
-      {1, top_k}, Model::DataType::kInt64, Model::DeviceType::kCPU);
+      {1, top_k}, topk_idx_dtype, Model::DeviceType::kCPU);
 
   const bool use_iobinding = gpt_step_model->SupportsIOBinding();
 
@@ -385,13 +388,13 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
           auto tv = step_output.topk_values->IsCPU()
               ? step_output.topk_values.get()
               : (step_output.topk_values = step_output.topk_values->ToCPU(), step_output.topk_values.get());
-          std::memcpy(topk_values_buf->Data<float>(), tv->Data<float>(), top_k * sizeof(float));
+          std::memcpy(topk_values_buf->Data(), tv->Data(), topk_values_buf->ByteSize());
         }
         {
           auto ti = step_output.topk_indices->IsCPU()
               ? step_output.topk_indices.get()
               : (step_output.topk_indices = step_output.topk_indices->ToCPU(), step_output.topk_indices.get());
-          std::memcpy(topk_indices_buf->Data<int64_t>(), ti->Data<int64_t>(), top_k * sizeof(int64_t));
+          std::memcpy(topk_indices_buf->Data(), ti->Data(), topk_indices_buf->ByteSize());
         }
         k_cache_out = std::move(step_output.k_cache_new);
         v_cache_out = std::move(step_output.v_cache_new);

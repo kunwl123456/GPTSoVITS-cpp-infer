@@ -63,8 +63,9 @@ public:
       }
     }
 
-    // Check if backend supports IO binding
-    // This will be set based on runtime detection in implementation
+    // ONNX backend supports ForwardWithPreallocatedOutput,
+    // enabling zero-copy ping-pong cache reuse in the step loop
+    m_supports_iobinding = true;
   }
 
   /**
