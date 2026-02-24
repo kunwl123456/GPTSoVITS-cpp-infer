@@ -309,7 +309,27 @@ public:
     auto x_len = std::move(encoder_output.x_len);
     auto y_len = std::move(encoder_output.y_len);
 
-    // 使用 vector<int64_t> 存储生成的 tokens，避免多次 Tensor 创建
+    // KV Cache dtype 对齐 + ping-pong 缓冲区
+    auto expected_cache_dtype = gpt_step->GetCacheDType();
+    if (k_cache && k_cache->Type() != expected_cache_dtype) {
+      k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
+    }
+    if (v_cache && v_cache->Type() != expected_cache_dtype) {
+      v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
+    }
+    auto k_cache_out = k_cache->Clone();
+    auto v_cache_out = v_cache->Clone();
+
+    // 预分配 topk 输出缓冲区
+    int top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
+    auto topk_val_dtype = gpt_step->GetModel()->GetOutputDataType("topk_values");
+    auto topk_idx_dtype = gpt_step->GetModel()->GetOutputDataType("topk_indices");
+    auto topk_values_buf = Model::Tensor::Empty(
+        {1, top_k}, topk_val_dtype, Model::DeviceType::kCPU);
+    auto topk_indices_buf = Model::Tensor::Empty(
+        {1, top_k}, topk_idx_dtype, Model::DeviceType::kCPU);
+
+    const bool use_iobinding = gpt_step->SupportsIOBinding();
     std::vector<int64_t> generated_tokens;
     const int64_t eos_token = 1024;
     const int max_steps = 1500;
@@ -328,45 +348,52 @@ public:
     for (int step = 0; step < max_steps; ++step) {
       idx->At<int64_t>(0) = step;
 
-      auto step_output =
-          gpt_step->Step(current_samples.get(), k_cache.get(), v_cache.get(),
-                         idx.get(), x_len.get(), y_len.get());
-
-      // 检查输出有效性
-      bool output_valid = step_output.topk_values &&
-                          step_output.topk_values->ElementCount() > 0 &&
-                          step_output.k_cache_new && step_output.v_cache_new;
-
-      if (output_valid) {
-        // 快速 NaN 检查
-        auto topk_cpu = step_output.topk_values->ToCPU();
-        const float* vals = topk_cpu->Data<float>();
-        for (int j = 0; j < topk_cpu->ElementCount(); ++j) {
-          if (!std::isfinite(vals[j])) {
-            output_valid = false;
-            break;
-          }
+      bool step_ok = false;
+      if (use_iobinding) {
+        step_ok = gpt_step->StepWithIOBinding(
+            current_samples.get(),
+            k_cache.get(), v_cache.get(),
+            k_cache_out.get(), v_cache_out.get(),
+            idx.get(), x_len.get(), y_len.get(),
+            topk_values_buf.get(), topk_indices_buf.get());
+      } else {
+        auto step_output =
+            gpt_step->Step(current_samples.get(), k_cache.get(), v_cache.get(),
+                           idx.get(), x_len.get(), y_len.get());
+        step_ok = step_output.topk_values &&
+                  step_output.topk_values->ElementCount() > 0 &&
+                  step_output.k_cache_new && step_output.v_cache_new;
+        if (step_ok) {
+          std::memcpy(topk_values_buf->Data(),
+                      step_output.topk_values->ToCPU()->Data(),
+                      topk_values_buf->ByteSize());
+          std::memcpy(topk_indices_buf->Data(),
+                      step_output.topk_indices->ToCPU()->Data(),
+                      topk_indices_buf->ByteSize());
+          k_cache_out = std::move(step_output.k_cache_new);
+          v_cache_out = std::move(step_output.v_cache_new);
         }
       }
 
-      if (!output_valid) {
+      if (!step_ok) {
         consecutive_invalid_count++;
         if (consecutive_invalid_count >= max_consecutive_invalid) {
           PrintError("[InferencePipeline] GPT Step failed {} times, stopping",
                      consecutive_invalid_count);
           break;
         }
-        // 重用上一个 token
         generated_tokens.push_back(current_samples->At<int64_t>(0));
         continue;
       }
 
       consecutive_invalid_count = 0;
-      k_cache = std::move(step_output.k_cache_new);
-      v_cache = std::move(step_output.v_cache_new);
 
-      int64_t next_token = Utils::SampleTopK(step_output.topk_values.get(),
-                                             step_output.topk_indices.get(),
+      // 交换 cache 指针（ping-pong）
+      std::swap(k_cache, k_cache_out);
+      std::swap(v_cache, v_cache_out);
+
+      int64_t next_token = Utils::SampleTopK(topk_values_buf.get(),
+                                             topk_indices_buf.get(),
                                              sample_config.temperature);
 
       // Token 有效性检查
@@ -978,7 +1005,27 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
     auto v_cache = std::move(encoder_output.v_cache);
     auto x_len = std::move(encoder_output.x_len);
     auto y_len = std::move(encoder_output.y_len);
-    // 生成的语义 tokens 列表
+
+    // KV Cache dtype 对齐 + ping-pong 缓冲区
+    auto s_expected_cache_dtype = gpt_step->GetCacheDType();
+    if (k_cache && k_cache->Type() != s_expected_cache_dtype) {
+      k_cache = k_cache->To(k_cache->GetDevice(), s_expected_cache_dtype);
+    }
+    if (v_cache && v_cache->Type() != s_expected_cache_dtype) {
+      v_cache = v_cache->To(v_cache->GetDevice(), s_expected_cache_dtype);
+    }
+    auto s_k_cache_out = k_cache->Clone();
+    auto s_v_cache_out = v_cache->Clone();
+
+    int s_top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
+    auto s_topk_val_dtype = gpt_step->GetModel()->GetOutputDataType("topk_values");
+    auto s_topk_idx_dtype = gpt_step->GetModel()->GetOutputDataType("topk_indices");
+    auto s_topk_values_buf = Model::Tensor::Empty(
+        {1, s_top_k}, s_topk_val_dtype, Model::DeviceType::kCPU);
+    auto s_topk_indices_buf = Model::Tensor::Empty(
+        {1, s_top_k}, s_topk_idx_dtype, Model::DeviceType::kCPU);
+
+    const bool s_use_iobinding = gpt_step->SupportsIOBinding();
     std::vector<int64_t> generated_tokens;
     std::deque<std::vector<int64_t>> chunk_queue;
     std::vector<int64_t> history_tokens;
@@ -1058,48 +1105,41 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       chunk_index++;
     };
     // GPT Step 自回归生成
-    // GPT Step 自回归生成 - 添加 NaN 检查和错误恢复
+    auto s_idx = Model::Tensor::Empty({1}, Model::DataType::kInt64,
+                                      Model::DeviceType::kCPU);
     int consecutive_invalid_count = 0;
     const int max_consecutive_invalid = 10;
     for (int step = 0; step < max_steps; ++step) {
-      auto idx = Model::Tensor::Empty({1}, Model::DataType::kInt64,
-                                      Model::DeviceType::kCPU);
-      idx->At<int64_t>(0) = step;
-      auto step_output =
-          gpt_step->Step(current_samples.get(), k_cache.get(), v_cache.get(),
-                         idx.get(), x_len.get(), y_len.get());
-      // 检查输出有效性（NaN/Inf 检查）
-      bool output_valid = true;
-      if (!step_output.topk_values ||
-          step_output.topk_values->ElementCount() == 0) {
-        PrintError(
-            "[InferencePipeline::InferStreaming] Step {}: topk_values is "
-            "empty!",
-            step);
-        output_valid = false;
-      } else if (!step_output.k_cache_new || !step_output.v_cache_new) {
-        PrintError(
-            "[InferencePipeline::InferStreaming] Step {}: cache_new is null!",
-            step);
-        output_valid = false;
+      s_idx->At<int64_t>(0) = step;
+
+      bool step_ok = false;
+      if (s_use_iobinding) {
+        step_ok = gpt_step->StepWithIOBinding(
+            current_samples.get(),
+            k_cache.get(), v_cache.get(),
+            s_k_cache_out.get(), s_v_cache_out.get(),
+            s_idx.get(), x_len.get(), y_len.get(),
+            s_topk_values_buf.get(), s_topk_indices_buf.get());
       } else {
-        // 检查是否有 NaN/Inf
-        auto topk_values_cpu = step_output.topk_values->To(
-            Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
-        const float* values = topk_values_cpu->Data<float>();
-        int k_check = topk_values_cpu->ElementCount();
-        for (int j = 0; j < k_check; ++j) {
-          if (!std::isfinite(values[j])) {
-            PrintError(
-                "[InferencePipeline::InferStreaming] Step {}: topk_values "
-                "contains NaN/Inf!",
-                step);
-            output_valid = false;
-            break;
-          }
+        auto step_output =
+            gpt_step->Step(current_samples.get(), k_cache.get(), v_cache.get(),
+                           s_idx.get(), x_len.get(), y_len.get());
+        step_ok = step_output.topk_values &&
+                  step_output.topk_values->ElementCount() > 0 &&
+                  step_output.k_cache_new && step_output.v_cache_new;
+        if (step_ok) {
+          std::memcpy(s_topk_values_buf->Data(),
+                      step_output.topk_values->ToCPU()->Data(),
+                      s_topk_values_buf->ByteSize());
+          std::memcpy(s_topk_indices_buf->Data(),
+                      step_output.topk_indices->ToCPU()->Data(),
+                      s_topk_indices_buf->ByteSize());
+          s_k_cache_out = std::move(step_output.k_cache_new);
+          s_v_cache_out = std::move(step_output.v_cache_new);
         }
       }
-      if (!output_valid) {
+
+      if (!step_ok) {
         consecutive_invalid_count++;
         if (consecutive_invalid_count >= max_consecutive_invalid) {
           PrintError(
@@ -1108,20 +1148,20 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
               consecutive_invalid_count, step);
           break;
         }
-        // 使用上一个有效 token 继续
-        int64_t last_valid_token = current_samples->At<int64_t>(0);
-        auto next_token_tensor = Model::Tensor::Empty(
-            {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-        next_token_tensor->At<int64_t>(0) = last_valid_token;
-        current_samples = next_token_tensor->Clone();
-        generated_tokens.push_back(last_valid_token);
+        generated_tokens.push_back(current_samples->At<int64_t>(0));
         token_counter++;
         continue;
       }
+
       consecutive_invalid_count = 0;
+
+      // 交换 cache 指针（ping-pong）
+      std::swap(k_cache, s_k_cache_out);
+      std::swap(v_cache, s_v_cache_out);
+
       // 采样下一个 token
-      int64_t next_token = Utils::SampleTopK(step_output.topk_values.get(),
-                                             step_output.topk_indices.get(),
+      int64_t next_token = Utils::SampleTopK(s_topk_values_buf.get(),
+                                             s_topk_indices_buf.get(),
                                              sample_config.temperature);
       // 检查 EOS
       if (next_token == eos_token) {
@@ -1129,25 +1169,8 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       }
       generated_tokens.push_back(next_token);
       token_counter++;
-      auto next_token_tensor = Model::Tensor::Empty(
-          {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-      next_token_tensor->At<int64_t>(0) = next_token;
-      current_samples = next_token_tensor->Clone();
-      // 更新 cache 并确保类型正确
-      auto expected_cache_dtype =
-          gpt_step->GetModel()->GetInputDataType("k_cache");
-      if (step_output.k_cache_new) {
-        k_cache = std::move(step_output.k_cache_new);
-        if (k_cache && k_cache->Type() != expected_cache_dtype) {
-          k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
-        }
-      }
-      if (step_output.v_cache_new) {
-        v_cache = std::move(step_output.v_cache_new);
-        if (v_cache && v_cache->Type() != expected_cache_dtype) {
-          v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
-        }
-      }
+      current_samples->At<int64_t>(0) = next_token;
+
       // 当token数量达到chunk_length时进行分割
       bool is_split = false;
       if (token_counter >= stream_config.chunk_length) {

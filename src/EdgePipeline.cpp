@@ -271,22 +271,41 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
         {1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
     idx->At<int64_t>(0) = 0;
 
-    // 从 encoder_output 获取 x_len 和 y_len (已在正确设备上)
+    // 从 encoder_output 获取 x_len 和 y_len
     auto x_len = std::move(encoder_output.x_len);
     auto y_len = std::move(encoder_output.y_len);
 
-    // KV Cache
+    // KV Cache + ping-pong 缓冲区
+    auto expected_cache_dtype = m_gpt_step_model->GetCacheDType();
     auto k_cache = std::move(encoder_output.k_cache);
     auto v_cache = std::move(encoder_output.v_cache);
+    if (k_cache && k_cache->Type() != expected_cache_dtype) {
+      k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
+    }
+    if (v_cache && v_cache->Type() != expected_cache_dtype) {
+      v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
+    }
+    auto k_cache_out = k_cache->Clone();
+    auto v_cache_out = v_cache->Clone();
 
-    // 生成的语义 tokens 列表（不包含参考部分）
-    // 每个 token 是 (1, 1)，最终在 axis=1 上拼接
-    std::vector<std::unique_ptr<Model::Tensor>> generated_tokens_list;
+    // 预分配 topk 输出缓冲区（dtype 匹配模型输出，留在 CPU 供采样使用）
+    int top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
+    auto topk_val_dtype = m_gpt_step_model->GetModel()->GetOutputDataType("topk_values");
+    auto topk_idx_dtype = m_gpt_step_model->GetModel()->GetOutputDataType("topk_indices");
+    auto topk_values_buf = Model::Tensor::Empty(
+        {1, top_k}, topk_val_dtype, Model::DeviceType::kCPU);
+    auto topk_indices_buf = Model::Tensor::Empty(
+        {1, top_k}, topk_idx_dtype, Model::DeviceType::kCPU);
+
+    const bool use_iobinding = m_gpt_step_model->SupportsIOBinding();
+
+    // 生成的语义 tokens
+    std::vector<int64_t> generated_tokens;
 
     // 添加第一个 token（如果不是 EOS）
     const int64_t eos_token = 1024;
     if (first_token != eos_token) {
-      generated_tokens_list.push_back(current_samples->Clone());
+      generated_tokens.push_back(first_token);
     }
 
     // GPT Step 自回归生成
@@ -295,61 +314,54 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     const int max_consecutive_invalid = 10;
 
     for (int step = 0; step < max_steps; ++step) {
-      auto step_output = m_gpt_step_model->Step(
-          current_samples.get(),
-          k_cache.get(),
-          v_cache.get(),
-          idx.get(),
-          x_len.get(),
-          y_len.get());
-
-      // 检查输出有效性
-      bool output_valid = true;
-      if (!step_output.topk_values || step_output.topk_values->ElementCount() == 0) {
-        PrintError("[EdgePipeline] Step {}: topk_values is empty!", step);
-        output_valid = false;
-      } else if (!step_output.k_cache_new || !step_output.v_cache_new) {
-        PrintError("[EdgePipeline] Step {}: k_cache_new or v_cache_new is null!", step);
-        output_valid = false;
+      bool step_ok = false;
+      if (use_iobinding) {
+        step_ok = m_gpt_step_model->StepWithIOBinding(
+            current_samples.get(),
+            k_cache.get(), v_cache.get(),
+            k_cache_out.get(), v_cache_out.get(),
+            idx.get(), x_len.get(), y_len.get(),
+            topk_values_buf.get(), topk_indices_buf.get());
       } else {
-        // 检查是否有 NaN/Inf
-        auto topk_values_cpu = step_output.topk_values->To(
-            Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
-        const float* values = topk_values_cpu->Data<float>();
-        int k = topk_values_cpu->ElementCount();
-        for (int j = 0; j < k; ++j) {
-          if (!std::isfinite(values[j])) {
-            PrintError("[EdgePipeline] Step {}: topk_values contains NaN/Inf!", step);
-            output_valid = false;
-            break;
-          }
+        auto step_output = m_gpt_step_model->Step(
+            current_samples.get(),
+            k_cache.get(), v_cache.get(),
+            idx.get(), x_len.get(), y_len.get());
+        step_ok = step_output.topk_values && step_output.k_cache_new && step_output.v_cache_new;
+        if (step_ok) {
+          std::memcpy(topk_values_buf->Data(),
+                      step_output.topk_values->ToCPU()->Data(),
+                      topk_values_buf->ByteSize());
+          std::memcpy(topk_indices_buf->Data(),
+                      step_output.topk_indices->ToCPU()->Data(),
+                      topk_indices_buf->ByteSize());
+          k_cache_out = std::move(step_output.k_cache_new);
+          v_cache_out = std::move(step_output.v_cache_new);
         }
       }
 
-      if (!output_valid) {
+      if (!step_ok) {
         consecutive_invalid_count++;
         if (consecutive_invalid_count >= max_consecutive_invalid) {
           PrintError("[EdgePipeline] GPT Step failed {} times consecutively, terminating at step {}",
                     consecutive_invalid_count, step);
           break;
         }
-        // 使用上一个有效 token 继续
-        int64_t last_valid_token = current_samples->At<int64_t>(0);
-        auto next_token_tensor = Model::Tensor::Empty(
-            {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-        next_token_tensor->At<int64_t>(0) = last_valid_token;
-        current_samples = next_token_tensor->Clone();
-        generated_tokens_list.push_back(std::move(next_token_tensor));
+        generated_tokens.push_back(current_samples->At<int64_t>(0));
         idx->At<int64_t>(0)++;
         continue;
       }
 
       consecutive_invalid_count = 0;
 
+      // 交换 cache 指针（ping-pong）
+      std::swap(k_cache, k_cache_out);
+      std::swap(v_cache, v_cache_out);
+
       // 采样下一个 token
       int64_t next_token = Utils::SampleTopK(
-          step_output.topk_values.get(),
-          step_output.topk_indices.get(),
+          topk_values_buf.get(),
+          topk_indices_buf.get(),
           sample_config.temperature);
 
       // 验证 token 有效性
@@ -364,38 +376,25 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
         break;
       }
 
-      // 创建新的 token tensor
-      auto next_token_tensor = Model::Tensor::Empty(
-          {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-      next_token_tensor->At<int64_t>(0) = next_token;
-      
-      // 先克隆用于下一次 step 的输入，再 move 到列表
-      current_samples = next_token_tensor->Clone();
-      generated_tokens_list.push_back(std::move(next_token_tensor));
-
-      // 更新 cache
-      k_cache = std::move(step_output.k_cache_new);
-      v_cache = std::move(step_output.v_cache_new);
-
-      // 更新索引 (CPU tensor 可直接访问)
+      generated_tokens.push_back(next_token);
+      current_samples->At<int64_t>(0) = next_token;
       idx->At<int64_t>(0)++;
     }
 
     // 检查是否有生成的 tokens
-    if (generated_tokens_list.empty()) {
+    if (generated_tokens.empty()) {
       PrintWarn("[EdgePipeline] No tokens generated, returning empty audio");
       return AudioTools::FromByte({}, m_config_params.sampling_rate);
     }
 
-    // 拼接所有生成的语义 tokens (在 axis=1 上拼接)
-    // 每个 token 是 (1, 1)，拼接后变成 (1, N)
-    std::vector<Model::Tensor*> token_ptrs;
-    for (const auto& t : generated_tokens_list) {
-      token_ptrs.push_back(t.get());
-    }
-    auto generated_sem = Model::Tensor::Concat(token_ptrs, 1);  // (1, N)
-    // 扩展维度为 (1, 1, N) 供 SoVITS 使用
-    generated_sem = generated_sem->View({1, 1, generated_sem->Shape()[1]});
+    PrintInfo("[EdgePipeline] Generated {} tokens for segment", generated_tokens.size());
+
+    // pred_semantic tensor (1, 1, N)
+    auto generated_sem = Model::Tensor::Empty(
+        {1, 1, static_cast<int64_t>(generated_tokens.size())},
+        Model::DataType::kInt64, Model::DeviceType::kCPU);
+    std::memcpy(generated_sem->Data<int64_t>(), generated_tokens.data(),
+                generated_tokens.size() * sizeof(int64_t));
 
     // SoVITS 音频生成
     // 验证 speaker_info 数据完整性

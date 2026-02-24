@@ -61,18 +61,17 @@ int64_t Sampler::Sample(const Model::Tensor* logits, const SamplingConfig& confi
   // 确保数据在CPU上并转换为float32
   std::unique_ptr<Model::Tensor> logits_cpu;
   if (logits->Type() == Model::DataType::kFloat32 && logits->IsCPU()) {
-    logits_cpu = logits->Clone();
-  } else if (logits->Type() == Model::DataType::kFloat32) {
-    logits_cpu = logits->ToCPU();
+    // 直接使用
   } else {
-    // 非float32类型需要显式转换
-    logits_cpu = logits->IsCPU() 
-        ? logits->ToType(Model::DataType::kFloat32)
-        : logits->ToCPU()->ToType(Model::DataType::kFloat32);
+    // 设备迁移+类型转换
+    logits_cpu = logits->To(
+        Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
   }
-  
-  const float* data = logits_cpu->Data<float>();
-  size_t size = static_cast<size_t>(logits_cpu->ElementCount());
+
+  const float* data = logits_cpu
+      ? logits_cpu->Data<float>()
+      : logits->Data<float>();
+  size_t size = static_cast<size_t>(logits->ElementCount());
   
   switch (config.strategy) {
     case SamplingStrategy::kGreedy: {
@@ -274,41 +273,28 @@ int64_t SampleTopK(
     return 0;
   }
 
-  // 一次性完成类型转换和设备迁移，减少中间拷贝
   std::unique_ptr<Model::Tensor> values_cpu_owner;
   std::unique_ptr<Model::Tensor> indices_cpu_owner;
-  
+
   const float* values_ptr = nullptr;
   const int64_t* indices_ptr = nullptr;
   int64_t k = topk_values->ElementCount();
-  
+
   // 处理 values 必须是 float32 且在 CPU
   if (topk_values->IsCPU() && topk_values->Type() == Model::DataType::kFloat32) {
     values_ptr = topk_values->Data<float>();
-  } else if (topk_values->IsCPU()) {
-    // 仅需类型转换
-    values_cpu_owner = topk_values->ToType(Model::DataType::kFloat32);
-    values_ptr = values_cpu_owner->Data<float>();
   } else {
-    // 需要设备迁移 + 类型转换
-    values_cpu_owner = topk_values->ToCPU();
-    if (values_cpu_owner->Type() != Model::DataType::kFloat32) {
-      values_cpu_owner = values_cpu_owner->ToType(Model::DataType::kFloat32);
-    }
+    values_cpu_owner = topk_values->To(
+        Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
     values_ptr = values_cpu_owner->Data<float>();
   }
-  
+
   // 处理 indices 必须是 int64 且在 CPU
   if (topk_indices->IsCPU() && topk_indices->Type() == Model::DataType::kInt64) {
     indices_ptr = topk_indices->Data<int64_t>();
-  } else if (topk_indices->IsCPU()) {
-    indices_cpu_owner = topk_indices->ToType(Model::DataType::kInt64);
-    indices_ptr = indices_cpu_owner->Data<int64_t>();
   } else {
-    indices_cpu_owner = topk_indices->ToCPU();
-    if (indices_cpu_owner->Type() != Model::DataType::kInt64) {
-      indices_cpu_owner = indices_cpu_owner->ToType(Model::DataType::kInt64);
-    }
+    indices_cpu_owner = topk_indices->To(
+        Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
     indices_ptr = indices_cpu_owner->Data<int64_t>();
   }
   

@@ -90,6 +90,14 @@ public:
   std::unique_ptr<Tensor> View(const std::vector<int64_t>& new_shape) const;
 
   /**
+   * @brief 创建共享所有权的零拷贝视图
+   * @param new_shape 新的形状
+   * @return 视图 Tensor（通过 shared_ptr 共享底层内存所有权）
+   * @note 即使源 Tensor 被销毁，视图仍持有内存引用
+   */
+  std::unique_ptr<Tensor> SharedView(const std::vector<int64_t>& new_shape) const;
+
+  /**
    * @brief 切片操作（尽可能零拷贝）
    * @param start 起始索引
    * @param end 结束索引

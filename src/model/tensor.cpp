@@ -164,7 +164,7 @@ std::unique_ptr<Tensor> Tensor::Clone() const {
 
 std::unique_ptr<Tensor> Tensor::ToDevice(Device device) const {
   if (device_ == device) {
-    return Clone();
+    return SharedView(shape_);  // 设备已匹配，返回共享所有权视图
   }
 
   auto new_tensor = Empty(shape_, dtype_, device);
@@ -204,7 +204,7 @@ std::unique_ptr<Tensor> Tensor::ToDevice(Device device) const {
 
 std::unique_ptr<Tensor> Tensor::ToType(DataType dtype) const {
   if (dtype_ == dtype) {
-    return Clone();
+    return SharedView(shape_);  // zero-copy: 类型已匹配，返回共享所有权视图
   }
 
   // 如果在 CUDA 上，使用 GPU kernel 进行类型转换
@@ -251,7 +251,7 @@ std::unique_ptr<Tensor> Tensor::ToType(DataType dtype) const {
 std::unique_ptr<Tensor> Tensor::To(Device device, DataType dtype) const {
   // 设备和类型都一致
   if (device_ == device && dtype_ == dtype) {
-    return Clone();
+    return SharedView(shape_);  // zero-copy: 都匹配，返回共享所有权视图
   }
 
   // 仅设备不一致 (H2D / D2H)
@@ -264,11 +264,14 @@ std::unique_ptr<Tensor> Tensor::To(Device device, DataType dtype) const {
     return ToType(dtype);
   }
 
-  // 综合转换 (最优路径: 在源/目标端更便宜的一端进行转换)
-  // 非标转换(如 Int64 -> Float16) 在 CPU 上会稳定点
-  // 先转
+  // 设备和类型都不一致
+  if (device_.type == DeviceType::kCUDA && device.type == DeviceType::kCUDA) {
+    // 同为 GPU: 直接用 GPU kernel 做类型转换（避免 GPU→CPU→转换→GPU 三步）
+    return ToType(dtype);
+  }
+
+  // 跨设备+跨类型: 先搬到 CPU 转类型，再搬到目标设备
   auto temp_cpu_typed = ToCPU()->ToType(dtype);
-  // 再搬运
   return temp_cpu_typed->ToDevice(device);
 }
 
@@ -320,6 +323,25 @@ std::unique_ptr<Tensor> Tensor::View(const std::vector<int64_t>& new_shape) cons
       dtype_,
       device_,
       [](void*) {});  // 空 deleter
+
+  return view;
+}
+
+std::unique_ptr<Tensor> Tensor::SharedView(const std::vector<int64_t>& new_shape) const {
+  int64_t new_numel = ComputeNumel(new_shape);
+  if (new_numel != numel_) {
+    THROW_ERRORN("SharedView failed: element count mismatch.");
+  }
+
+  // 通过捕获 data_ptr_（shared_ptr）来共享内存所有权
+  // 即使源 Tensor 被销毁，shared_ptr 引用计数仍 > 0，内存不会被释放
+  auto shared = data_ptr_;  // 增加引用计数
+  auto view = std::make_unique<Tensor>(
+      shared.get(),
+      new_shape,
+      dtype_,
+      device_,
+      [shared](void*) mutable { shared.reset(); });  // 释放时减少引用计数
 
   return view;
 }

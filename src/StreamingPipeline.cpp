@@ -572,10 +572,12 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     PrintError("[StreamingPipeline::DecodeChunk] speaker_info.m_refer_spec is null");
     return {};
   }
-  auto refer_spec_input = speaker_info.m_refer_spec->Clone();  // 使用 Clone 确保内存安全
-  auto refer_shape = refer_spec_input->Shape();
+  auto refer_shape = speaker_info.m_refer_spec->Shape();
+  std::unique_ptr<Model::Tensor> refer_spec_view;
+  Model::Tensor* refer_spec_ptr = speaker_info.m_refer_spec.get();
   if (refer_shape.size() == 2) {
-    refer_spec_input->Reshape({1, refer_shape[0], refer_shape[1]});
+    refer_spec_view = speaker_info.m_refer_spec->View({1, refer_shape[0], refer_shape[1]});
+    refer_spec_ptr = refer_spec_view.get();
   }
 
   // 准备 sv_emb - 添加空指针检查
@@ -583,10 +585,12 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     PrintError("[StreamingPipeline::DecodeChunk] speaker_info.m_sv_emb is null");
     return {};
   }
-  auto sv_emb_input = speaker_info.m_sv_emb->Clone();  // 使用 Clone 确保内存安全
-  auto sv_shape = sv_emb_input->Shape();
+  auto sv_shape = speaker_info.m_sv_emb->Shape();
+  std::unique_ptr<Model::Tensor> sv_emb_view;
+  Model::Tensor* sv_emb_ptr = speaker_info.m_sv_emb.get();
   if (sv_shape.size() == 1) {
-    sv_emb_input->Reshape({1, sv_shape[0]});
+    sv_emb_view = speaker_info.m_sv_emb->View({1, sv_shape[0]});
+    sv_emb_ptr = sv_emb_view.get();
   }
 
   // 检查 sovits_model 是否有效
@@ -605,8 +609,8 @@ std::vector<float> StreamingPipeline::DecodeChunk(
   PrintDebug("[StreamingPipeline::DecodeChunk] Converting tensors to target device...");
   auto pred_semantic_final = pred_semantic->To(target_device, pred_dtype);
   auto text_seq_final = text_seq->To(target_device, text_dtype);
-  auto refer_spec_final = refer_spec_input->To(target_device, spec_dtype);
-  auto sv_emb_final = sv_emb_input->To(target_device, sv_dtype);
+  auto refer_spec_final = refer_spec_ptr->To(target_device, spec_dtype);
+  auto sv_emb_final = sv_emb_ptr->To(target_device, sv_dtype);
   PrintDebug("[StreamingPipeline::DecodeChunk] Tensor conversion done, calling GenerateTensor...");
 
   // SoVITS 推理
@@ -730,8 +734,13 @@ int StreamingPipeline::FindBestSplitPoint(const std::vector<int64_t>& tokens, in
     return -1;
   }
 
-  // 获取 mute_matrix 数据
-  auto mute_cpu = m_mute_matrix->IsCPU() ? m_mute_matrix.get() : m_mute_matrix->ToCPU().get();
+  // 获取 mute_matrix 数据（延长 ToCPU 返回值的生命周期）
+  std::unique_ptr<Model::Tensor> mute_cpu_owner;
+  const Model::Tensor* mute_cpu = m_mute_matrix.get();
+  if (!m_mute_matrix->IsCPU()) {
+    mute_cpu_owner = m_mute_matrix->ToCPU();
+    mute_cpu = mute_cpu_owner.get();
+  }
   const float* mute_scores = mute_cpu->Data<float>();
 
   // 计算每个位置的分割得分
