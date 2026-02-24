@@ -316,42 +316,35 @@ int64_t SampleTopK(
   if (temperature <= 1e-6f) {
     temperature = 1.0f;
   }
-  
+
   // 使用线程局部缓冲区，避免每次分配
   auto& probs = GetThreadLocalProbsBuffer();
   if (probs.size() < static_cast<size_t>(k)) {
     probs.resize(static_cast<size_t>(k));
   }
-  
+
   // ================================================================
+  //   if temperature != 1.0: topk_values = topk_values / temperature
   //   topk_values = topk_values - np.max(topk_values)
   //   probs = np.exp(topk_values)
   //   probs /= np.sum(probs)
+  // 先 /temperature，再 -max。
   // ================================================================
-  
-  // 找最大值 (数值稳定性)
-  float max_val = values_ptr[0];
+
+  // 先除以 temperature（在原始 logit 空间）
+  // 找缩放后的最大值
+  float max_val = values_ptr[0] / temperature;
   for (int64_t i = 1; i < k; ++i) {
-    if (values_ptr[i] > max_val) max_val = values_ptr[i];
+    float scaled = values_ptr[i] / temperature;
+    if (scaled > max_val) max_val = scaled;
   }
-  
-  // 计算 exp((x - max) / temperature) 并求和
-  // Python: topk_values = topk_values - np.max(topk_values)
-  //         probs = np.exp(topk_values)
+
+  // exp(scaled - max)
   float sum = 0.0f;
   for (int64_t i = 0; i < k; ++i) {
-    float logit = values_ptr[i] - max_val;  // 先减去最大值
-    if (temperature != 1.0f && temperature > 1e-6f) {
-      logit /= temperature;  // 只有当 temperature != 1.0 时才除以温度
-    }
-    // Clamp 防止 exp 溢出/下溢
-    if (logit > 50.0f) {
-      logit = 50.0f;
-    } else if (logit < -50.0f) {
-      logit = -50.0f;
-    }
+    float logit = values_ptr[i] / temperature - max_val;
     probs[i] = std::exp(logit);
-    // 检查 NaN/Inf
+    // 仅过滤 NaN/Inf（硬件异常保护，不截断正常范围）
     if (!std::isfinite(probs[i])) {
       probs[i] = 0.0f;
     }

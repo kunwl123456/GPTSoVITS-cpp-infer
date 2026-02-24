@@ -229,12 +229,10 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     first_token = std::max<int64_t>(0, std::min<int64_t>(first_token, 1024));
   }
 
-  // 创建第一个 token tensor (CPU)
   auto current_samples = Model::Tensor::Empty(
       {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
   current_samples->At<int64_t>(0) = first_token;
 
-  // 准备索引
   auto idx = Model::Tensor::Empty(
       {1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
   idx->At<int64_t>(0) = 0;
@@ -243,27 +241,34 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   auto x_len = std::move(encoder_output.x_len);
   auto y_len = std::move(encoder_output.y_len);
 
-  // KV Cache
+  auto expected_cache_dtype = gpt_step_model->GetCacheDType();
+
   auto k_cache = std::move(encoder_output.k_cache);
   auto v_cache = std::move(encoder_output.v_cache);
-
-  // 检查 cache 是否需要类型转换
-  auto expected_cache_dtype = gpt_step_model->GetModel()->GetInputDataType("k_cache");
   if (k_cache && k_cache->Type() != expected_cache_dtype) {
-    PrintDebug("[StreamingPipeline] Converting k_cache from type {} to {}",
-               static_cast<int>(k_cache->Type()), static_cast<int>(expected_cache_dtype));
     k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
   }
   if (v_cache && v_cache->Type() != expected_cache_dtype) {
-    PrintDebug("[StreamingPipeline] Converting v_cache from type {} to {}",
-               static_cast<int>(v_cache->Type()), static_cast<int>(expected_cache_dtype));
     v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
   }
 
+  // 预分配 ping-pong cache 缓冲区
+  auto k_cache_out = k_cache->Clone();
+  auto v_cache_out = v_cache->Clone();
+
+  // 预分配 topk 输出缓冲区
+  int top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
+  auto topk_values_buf = Model::Tensor::Empty(
+      {1, top_k}, Model::DataType::kFloat32, Model::DeviceType::kCPU);
+  auto topk_indices_buf = Model::Tensor::Empty(
+      {1, top_k}, Model::DataType::kInt64, Model::DeviceType::kCPU);
+
+  const bool use_iobinding = gpt_step_model->SupportsIOBinding();
+
   // 生成的语义 tokens 列表
   std::vector<int64_t> generated_tokens;
-  std::deque<std::vector<int64_t>> chunk_queue;  // 待解码的分块队列
-  std::vector<int64_t> history_tokens;           // 已解码的历史tokens
+  std::deque<std::vector<int64_t>> chunk_queue;
+  std::vector<int64_t> history_tokens;
 
   const int64_t eos_token = 1024;
   if (first_token != eos_token) {
@@ -360,54 +365,65 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   const int max_consecutive_invalid = 10;
 
   for (int step = 0; step < max_steps; ++step) {
-    auto step_output = gpt_step_model->Step(
-        current_samples.get(),
-        k_cache.get(),
-        v_cache.get(),
-        idx.get(),
-        x_len.get(),
-        y_len.get());
-
-    // 检查输出有效性
-    bool output_valid = true;
-    if (!step_output.topk_values || step_output.topk_values->ElementCount() == 0) {
-      PrintError("[StreamingPipeline] Step {}: topk_values is empty!", step);
-      output_valid = false;
-    } else if (!step_output.k_cache_new || !step_output.v_cache_new) {
-      PrintError("[StreamingPipeline] Step {}: k_cache_new or v_cache_new is null!", step);
-      output_valid = false;
+    // GPT Step
+    bool step_ok = false;
+    if (use_iobinding) {
+      step_ok = gpt_step_model->StepWithIOBinding(
+          current_samples.get(),
+          k_cache.get(), v_cache.get(),
+          k_cache_out.get(), v_cache_out.get(),
+          idx.get(), x_len.get(), y_len.get(),
+          topk_values_buf.get(), topk_indices_buf.get());
+    } else {
+      auto step_output = gpt_step_model->Step(
+          current_samples.get(), k_cache.get(), v_cache.get(),
+          idx.get(), x_len.get(), y_len.get());
+      step_ok = step_output.topk_values && step_output.k_cache_new && step_output.v_cache_new;
+      if (step_ok) {
+        // 复制输出到预分配缓冲区
+        {
+          auto tv = step_output.topk_values->IsCPU()
+              ? step_output.topk_values.get()
+              : (step_output.topk_values = step_output.topk_values->ToCPU(), step_output.topk_values.get());
+          std::memcpy(topk_values_buf->Data<float>(), tv->Data<float>(), top_k * sizeof(float));
+        }
+        {
+          auto ti = step_output.topk_indices->IsCPU()
+              ? step_output.topk_indices.get()
+              : (step_output.topk_indices = step_output.topk_indices->ToCPU(), step_output.topk_indices.get());
+          std::memcpy(topk_indices_buf->Data<int64_t>(), ti->Data<int64_t>(), top_k * sizeof(int64_t));
+        }
+        k_cache_out = std::move(step_output.k_cache_new);
+        v_cache_out = std::move(step_output.v_cache_new);
+      }
     }
 
-    if (!output_valid) {
+    if (!step_ok) {
       consecutive_invalid_count++;
       if (consecutive_invalid_count >= max_consecutive_invalid) {
         PrintError("[StreamingPipeline] GPT Step failed {} times consecutively, terminating at step {}",
                    consecutive_invalid_count, step);
         break;
       }
-      // 使用上一个有效 token 继续
-      int64_t last_valid_token = current_samples->At<int64_t>(0);
-      auto next_token_tensor = Model::Tensor::Empty(
-          {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-      next_token_tensor->At<int64_t>(0) = last_valid_token;
-      current_samples = next_token_tensor->Clone();
-      generated_tokens.push_back(last_valid_token);
-      token_counter++;
       idx->At<int64_t>(0)++;
+      token_counter++;
+      generated_tokens.push_back(current_samples->At<int64_t>(0));
       continue;
     }
 
     consecutive_invalid_count = 0;
 
+    // 交换 cache 指针，下一步 k_cache_out 变成输入
+    std::swap(k_cache, k_cache_out);
+    std::swap(v_cache, v_cache_out);
+
     // 采样下一个 token
     int64_t next_token = Utils::SampleTopK(
-        step_output.topk_values.get(),
-        step_output.topk_indices.get(),
+        topk_values_buf.get(),
+        topk_indices_buf.get(),
         temperature);
 
-    // 验证 token 有效性
     if (next_token < 0 || next_token > 1024) {
-      PrintWarn("[StreamingPipeline] Step {}: Invalid token {}, clamping to valid range", step, next_token);
       next_token = std::max<int64_t>(0, std::min<int64_t>(next_token, 1024));
     }
 
@@ -420,35 +436,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     generated_tokens.push_back(next_token);
     token_counter++;
 
-    auto next_token_tensor = Model::Tensor::Empty(
-        {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-    next_token_tensor->At<int64_t>(0) = next_token;
-    
-    // 先clone用于下一次step输入，再move
-    current_samples = next_token_tensor->Clone();
-
-    // 更新 cache 并检查类型
-    auto expected_cache_dtype = gpt_step_model->GetModel()->GetInputDataType("k_cache");
-    
-    if (step_output.k_cache_new) {
-      k_cache = std::move(step_output.k_cache_new);
-      // 确保类型正确
-      if (k_cache && k_cache->Type() != expected_cache_dtype) {
-        k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
-      }
-    } else {
-      PrintError("[StreamingPipeline] Step {}: k_cache_new is null!", step);
-    }
-    
-    if (step_output.v_cache_new) {
-      v_cache = std::move(step_output.v_cache_new);
-      // 确保类型正确
-      if (v_cache && v_cache->Type() != expected_cache_dtype) {
-        v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
-      }
-    } else {
-      PrintError("[StreamingPipeline] Step {}: v_cache_new is null!", step);
-    }
+    current_samples->At<int64_t>(0) = next_token;
 
     // 更新索引
     idx->At<int64_t>(0)++;
@@ -524,7 +512,7 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     const std::vector<int64_t>& target_phones,
     float noise_scale,
     float speed) {
-  
+
   if (chunk_tokens.empty()) {
     return {};
   }
@@ -532,28 +520,27 @@ std::vector<float> StreamingPipeline::DecodeChunk(
   auto sovits_model = m_edge_pipeline->GetSoVITSModel();
   int sampling_rate = m_edge_pipeline->GetSamplingRate();
 
-  // 构建输入tokens：历史 + 当前 + 前瞻
+  // 截断 history 到 h_len
+  size_t h_used = std::min(history_tokens.size(), static_cast<size_t>(m_config.h_len));
+  // 截断 lookahead 到 l_len
+  size_t l_used = std::min(lookahead_tokens.size(), static_cast<size_t>(m_config.l_len));
+
+  // input_tokens = history[-h_len:] + chunk + lookahead[:l_len]
   std::vector<int64_t> input_tokens;
-  
-  // 添加历史tokens（最后h_len个）
-  if (!history_tokens.empty()) {
-    size_t h_start = history_tokens.size() > static_cast<size_t>(m_config.h_len) ?
-        history_tokens.size() - m_config.h_len : 0;
-    input_tokens.insert(input_tokens.end(),
-                        history_tokens.begin() + h_start,
-                        history_tokens.end());
+  input_tokens.reserve(h_used + chunk_tokens.size() + l_used);
+  if (h_used > 0) {
+    auto h_start = history_tokens.end() - static_cast<ptrdiff_t>(h_used);
+    input_tokens.insert(input_tokens.end(), h_start, history_tokens.end());
   }
-
-  // 添加当前分块
   input_tokens.insert(input_tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
-
-  // 添加前瞻tokens（前l_len个）
-  if (!lookahead_tokens.empty()) {
-    input_tokens.insert(input_tokens.end(), lookahead_tokens.begin(), lookahead_tokens.end());
+  if (l_used > 0) {
+    input_tokens.insert(input_tokens.end(),
+                        lookahead_tokens.begin(),
+                        lookahead_tokens.begin() + static_cast<ptrdiff_t>(l_used));
   }
 
-  PrintDebug("[StreamingPipeline::DecodeChunk] input_tokens size: {}, chunk: {}, history: {}, lookahead: {}",
-            input_tokens.size(), chunk_tokens.size(), history_tokens.size(), lookahead_tokens.size());
+  PrintDebug("[StreamingPipeline::DecodeChunk] input_tokens={}, h_used={}, chunk={}, l_used={}",
+            input_tokens.size(), h_used, chunk_tokens.size(), l_used);
 
   // 检查 target_phones 是否有效
   if (target_phones.empty()) {
@@ -642,7 +629,7 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     PrintError("[StreamingPipeline::DecodeChunk] audio_cpu is null or empty after To");
     return {};
   }
-  
+
   size_t audio_size = audio_cpu->ElementCount();
   const float* audio_ptr = audio_cpu->Data<float>();
 
@@ -651,58 +638,32 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     return {};
   }
 
-  std::vector<float> audio_vec(audio_size);
-  std::memcpy(audio_vec.data(), audio_ptr, audio_size * sizeof(float));
+  std::vector<float> result(audio_size);
+  std::memcpy(result.data(), audio_ptr, audio_size * sizeof(float));
 
-  audio_cpu.reset();
+  // 裁剪：只取 chunk 对应的部分，去掉 history 和 lookahead 的音频
+  // res = audio.flatten()[h_samples : h_samples + c_samples]
+  // samples_per_token = (sr / 25) / speed，语义帧率 25Hz
+  int samples_per_token = static_cast<int>(std::round(
+      static_cast<float>(sampling_rate) / 25.0f / speed));
+  int h_samples = static_cast<int>(h_used) * samples_per_token;
+  int c_samples = static_cast<int>(chunk_tokens.size()) * samples_per_token;
 
-  // 计算应该返回的样本数（仅当前分块的部分）
-  int samples_per_token = static_cast<int>((sampling_rate / 25) / speed);  // 语义帧率为 25Hz
-  
-  // 注意：history_tokens 在构建 input_tokens 时已经被截断到 h_len，
-  // 但这里的 history_tokens 是完整的历史，需要重新计算
-  size_t effective_history = std::min(history_tokens.size(), static_cast<size_t>(m_config.h_len));
-  int h_samples = static_cast<int>(effective_history) * samples_per_token;
-  int chunk_samples = static_cast<int>(chunk_tokens.size()) * samples_per_token;
-
-  // 验证计算结果
-  if (h_samples < 0 || chunk_samples < 0) {
-    PrintError("[StreamingPipeline::DecodeChunk] Invalid sample calculation: h_samples={}, chunk_samples={}", 
-               h_samples, chunk_samples);
+  if (h_samples >= static_cast<int>(audio_size)) {
+    PrintWarn("[StreamingPipeline::DecodeChunk] h_samples({}) >= audio_size({}), skipping chunk",
+              h_samples, audio_size);
     return {};
   }
 
-  PrintDebug("[StreamingPipeline::DecodeChunk] audio_size: {}, h_samples: {}, chunk_samples: {}, effective_history: {}",
-            audio_size, h_samples, chunk_samples, effective_history);
-
-  std::vector<float> result;
-  audio_size = audio_vec.size();
-  
-  if (static_cast<size_t>(h_samples) >= audio_size) {
-    // h_samples 超出音频范围，返回部分音频
-    PrintWarn("[StreamingPipeline::DecodeChunk] h_samples ({}) >= audio_size ({}), returning partial audio",
-             h_samples, audio_size);
-    size_t return_size = std::min(audio_size, static_cast<size_t>(chunk_samples));
-    result.assign(audio_vec.begin(), audio_vec.begin() + return_size);
-  } else {
-    // 提取 h_samples 到 h_samples + chunk_samples 的部分
-    size_t available = audio_size - h_samples;
-    size_t return_size = std::min(static_cast<size_t>(chunk_samples), available);
-    
-    if (h_samples + return_size > audio_size) {
-      PrintError("[StreamingPipeline::DecodeChunk] Buffer overflow prevented: h_samples({}) + return_size({}) > audio_size({})",
-                 h_samples, return_size, audio_size);
-      return_size = audio_size > static_cast<size_t>(h_samples) ? audio_size - h_samples : 0;
-    }
-    
-    if (return_size > 0) {
-      result.assign(audio_vec.begin() + h_samples, audio_vec.begin() + h_samples + return_size);
-    } else {
-      PrintWarn("[StreamingPipeline::DecodeChunk] return_size is 0, returning empty");
-    }
+  int end = h_samples + c_samples;
+  if (end > static_cast<int>(audio_size)) {
+    end = static_cast<int>(audio_size);
   }
 
-  PrintDebug("[StreamingPipeline::DecodeChunk] result size: {}", result.size());
+  result.assign(result.begin() + h_samples, result.begin() + end);
+
+  PrintDebug("[StreamingPipeline::DecodeChunk] audio_size={}, h_samples={}, c_samples={}, result={}",
+            audio_size, h_samples, c_samples, result.size());
 
   return result;
 }
