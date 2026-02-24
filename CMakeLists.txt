@@ -8,7 +8,7 @@ project(gsv_cpp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
+add_compile_definitions(_USE_MATH_DEFINES)
 # 如果启用了 CUDA，设置 CUDA 编译选项
 if (ENABLE_CUDA)
     enable_language(CUDA)

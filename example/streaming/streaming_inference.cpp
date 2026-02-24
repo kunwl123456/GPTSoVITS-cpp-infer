@@ -338,7 +338,7 @@ int main(int argc, char* argv[]) {
     GPTSoVITS::StreamingConfig streaming_config;
     streaming_config.chunk_length = chunk_length;  // 分块长度（token数）
     streaming_config.pause_length = pause_length;  // 段落间停顿（秒）
-    streaming_config.fade_length = 1280;           // 淡入淡出长度（采样点）
+    streaming_config.fade_length = 1280;            // 淡入淡出长度（采样点）
     streaming_config.h_len = 512;                  // 历史token长度
     streaming_config.l_len = 16;                   // 前瞻token长度
     streaming_config.enable_fade = true;           // 启用淡入淡出
