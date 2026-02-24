@@ -17,6 +17,12 @@
 #else
 #define MODEL_PATH R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
 #endif
+#ifdef _HOST_WINDOWS_
+auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
+#else
+auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
+#endif
+
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
@@ -49,7 +55,9 @@ int main(int argc, char* argv[]) {
     std::cout << "  输出路径: " << output_path << std::endl;
 
     // 创建 Pipeline 配置
-    GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::FullCUDA(MODEL_PATH);
+    GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Full(MODEL_PATH);
+    config.device_type = device.type;
+    config.device_id = device.device_id;
     config.resources_path = "./res";  // 资源文件路径
     config.verbose = true;
 

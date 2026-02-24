@@ -172,7 +172,7 @@ int main(int argc, char* argv[]) {
     float temperature = 1.0f;
     int top_k = 40;
     float top_p = 0.6f;
-    float noise_scale = 0.5f;
+    float noise_scale = 0.35f;
     float speed = 1.0f;
     int chunk_length = 24;
     float pause_length = 0.3f;

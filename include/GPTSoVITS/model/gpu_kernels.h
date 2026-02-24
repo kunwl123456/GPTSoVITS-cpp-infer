@@ -50,20 +50,20 @@ cudaError_t LaunchSoftmaxKernel(float* logits,
 #else
 
 // Stubs for non-CUDA builds
-inline cudaError_t LaunchTypeConversionKernel(const void*,
-                                              void*,
-                                              int64_t,
-                                              DataType,
-                                              DataType,
-                                              void* = nullptr) {
-  return cudaErrorNotSupported;
+inline int LaunchTypeConversionKernel(const void*,
+                                      void*,
+                                      int64_t,
+                                      DataType,
+                                      DataType,
+                                      void* = nullptr) {
+  return -1; // Operation not supported
 }
 
-inline cudaError_t LaunchSoftmaxKernel(float*,
-                                       int64_t,
-                                       float,
-                                       void* = nullptr) {
-  return cudaErrorNotSupported;
+inline int LaunchSoftmaxKernel(float*,
+                                int64_t,
+                                float,
+                                void* = nullptr) {
+  return -1; // Operation not supported
 }
 
 #endif // WITH_CUDA
