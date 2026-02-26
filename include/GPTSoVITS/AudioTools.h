@@ -12,6 +12,18 @@
 
 namespace GPTSoVITS {
 
+/**
+ * @brief 音频分块
+ */
+struct AudioChunk {
+  std::vector<float> audio_data;
+  bool is_first = false;
+  bool is_last = false;
+  int segment_index = 0;
+  int chunk_index = 0;
+  float duration = 0.0f;
+};
+
 class AudioTools {
   SF_INFO m_sfinfo = {0};
   SNDFILE *m_infile = nullptr;

@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "AudioTools.h"
 #include "GPTSoVITS/Core/DeviceContext.h"
 #include "GPTSoVITS/Core/ModelPool.h"
 #include "GPTSoVITS/SpeakerManager.h"
@@ -99,18 +100,6 @@ struct PipelineConfig {
   static PipelineConfig FullCUDA(const std::string& model_path, int device_id = 0) {
     return Full(model_path, Model::DeviceType::kCUDA, device_id);
   }
-};
-
-/**
- * @brief 流式音频分块
- */
-struct AudioChunk {
-  std::vector<float> audio_data;
-  bool is_first = false;
-  bool is_last = false;
-  int segment_index = 0;
-  int chunk_index = 0;
-  float duration = 0.0f;
 };
 
 /**
@@ -254,7 +243,8 @@ public:
       const Model::SampleConfig& sample_config = {},
       float noise_scale = 0.5f,
       float speed = 1.0f,
-      Model::InferStats* stats = nullptr);
+      Model::InferStats* stats = nullptr,
+      std::function<void()> on_first_segment = nullptr);
 
   /**
    * @brief 简化推理接口（使用默认参数）

@@ -9,6 +9,7 @@
 #include <string>
 
 #include "GPTSoVITS/AudioTools.h"
+#include "GPTSoVITS/GPTSoVITS.h"
 #include "GPTSoVITS/InferencePipeline.h"
 #include "GPTSoVITS/model/sample_config.h"
 
@@ -93,7 +94,13 @@ int main(int argc, char* argv[]) {
 
     auto t_start = std::chrono::steady_clock::now();
     GPTSoVITS::Model::InferStats stats;
-    auto audio   = pipeline.Infer(speaker_name, text, text_lang, {}, 0.5f, 1.0f, &stats);
+    double first_segment_latency_ms = 0.0;
+    auto audio   = pipeline.Infer(speaker_name, text, text_lang, {}, 0.5f, 1.0f, &stats,
+                                  [&]() {
+                                    first_segment_latency_ms =
+                                        std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - t_start).count();
+                                  });
     auto t_end   = std::chrono::steady_clock::now();
 
     if (!audio) {
@@ -116,6 +123,9 @@ int main(int argc, char* argv[]) {
               << " " << stats.gpt_tokens << " tokens)\n";
     std::cout << "SoVITS Audio Decode:    " << std::fixed << std::setprecision(3)
               << stats.sovits_time_s << "s\n";
+    if (first_segment_latency_ms > 0.0)
+      std::cout << "First Segment Latency:  " << std::fixed << std::setprecision(2)
+                << first_segment_latency_ms << " ms\n";
     std::cout << "Total Inference Time:   " << std::fixed << std::setprecision(3)
               << elapsed_ms / 1000.0 << "s\n";
     std::cout << "Total Audio Duration:   " << std::fixed << std::setprecision(3)

@@ -16,6 +16,7 @@
 #include "GPTSoVITS/AudioTools.h"
 #include "GPTSoVITS/EdgePipeline.h"
 #include "GPTSoVITS/GPTSoVITS.h"
+#include "GPTSoVITS/InferencePipeline.h"
 #include "GPTSoVITS/StreamingPipeline.h"
 #include "GPTSoVITS/model/backend/onnx_backend.h"
 #include "GPTSoVITS/model/sample_config.h"

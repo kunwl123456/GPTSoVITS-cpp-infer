@@ -613,7 +613,8 @@ std::vector<std::string> InferencePipeline::ListSpeakers() const {
 std::unique_ptr<AudioTools> InferencePipeline::Infer(
     const std::string& speaker_name, const std::string& text,
     const std::string& lang, const Model::SampleConfig& sample_config,
-    float noise_scale, float speed, Model::InferStats* stats) {
+    float noise_scale, float speed, Model::InferStats* stats,
+    std::function<void()> on_first_segment) {
   auto* speaker = GetSpeaker(speaker_name);
   if (!speaker) {
     PrintError("[InferencePipeline] Speaker not found: {}", speaker_name);
@@ -668,9 +669,12 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
     
     auto audio = impl_->InferSegment(*speaker, segments[i], use_lang,
                                      sample_config, noise_scale, speed, stats);
+    if (i == 0 && on_first_segment) {
+      on_first_segment();
+    }
     if (audio) {
       auto samples = audio->ReadSamples();
-      
+
       // 每个 segment 进行 DC offset 去除
       final_audio.insert(final_audio.end(), samples.begin(), samples.end());
       

@@ -35,17 +35,6 @@ struct StreamingConfig {
   std::string mute_matrix_path;   // 静音矩阵文件路径（可选）
 };
 
-/**
- * @brief 音频分块
- */
-struct AudioChunk {
-  std::vector<float> audio_data;  // 音频数据
-  bool is_first;                  // 是否是第一个分块
-  bool is_last;                   // 是否是最后一个分块
-  int segment_index;              // 段落索引
-  int chunk_index;                // 分块索引
-  float duration;                 // 音频时长（秒）
-};
 
 /**
  * @brief 流推理 Pipeline
