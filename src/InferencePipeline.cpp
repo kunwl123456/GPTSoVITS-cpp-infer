@@ -3,6 +3,8 @@
 //
 #include "GPTSoVITS/InferencePipeline.h"
 
+#include <chrono>
+
 #include <algorithm>
 #include <deque>
 #include <numeric>
@@ -182,7 +184,7 @@ public:
   std::unique_ptr<AudioTools> InferSegment(
       SpeakerFeatures& speaker, const std::string& text,
       const std::string& lang, const Model::SampleConfig& sample_config,
-      float noise_scale, float speed) {
+      float noise_scale, float speed, Model::InferStats* stats = nullptr) {
     PrintDebug("[InferencePipeline] Inferring segment: {}", text);
     auto device = device_ctx->GetDevice();
     
@@ -344,6 +346,9 @@ public:
     int consecutive_invalid_count = 0;
     const int max_consecutive_invalid = 10;
 
+    // 记录 GPT 生成开始时间（用于计算 tokens/s）
+    auto gpt_gen_start = std::chrono::steady_clock::now();
+
     for (int step = 0; step < max_steps; ++step) {
       idx->At<int64_t>(0) = step;
 
@@ -407,6 +412,17 @@ public:
         PrintDebug("[InferencePipeline] EOS at step {}", step);
         break;
       }
+    }
+
+    // 计算 GPT 生成性能
+    auto gpt_gen_end = std::chrono::steady_clock::now();
+    double gpt_gen_time_s = std::chrono::duration<double>(gpt_gen_end - gpt_gen_start).count();
+    double tokens_per_sec = generated_tokens.size() / gpt_gen_time_s;
+    PrintInfo("[InferencePipeline] GPT generation: {} tokens in {:.3f}s ({:.2f} tokens/s)",
+              generated_tokens.size(), gpt_gen_time_s, tokens_per_sec);
+    if (stats) {
+      stats->gpt_tokens += static_cast<int>(generated_tokens.size());
+      stats->gpt_time_s += gpt_gen_time_s;
     }
 
     if (generated_tokens.empty()) {
@@ -480,9 +496,14 @@ public:
     auto sv_emb_final = sv_emb_ptr->To(sovits_device, sv_dtype);
     
     // SoVITS 推理
+    auto t_sovits_start = std::chrono::steady_clock::now();
     auto audio_tensor = sovits->GenerateTensor(
         pred_semantic_final.get(), text_seq_final.get(), refer_spec_final.get(),
         sv_emb_final.get(), noise_scale, speed);
+    if (stats) {
+      stats->sovits_time_s += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_sovits_start).count();
+    }
     
     if (!audio_tensor) {
       PrintError("[InferencePipeline] SoVITS generation failed");
@@ -592,7 +613,7 @@ std::vector<std::string> InferencePipeline::ListSpeakers() const {
 std::unique_ptr<AudioTools> InferencePipeline::Infer(
     const std::string& speaker_name, const std::string& text,
     const std::string& lang, const Model::SampleConfig& sample_config,
-    float noise_scale, float speed) {
+    float noise_scale, float speed, Model::InferStats* stats) {
   auto* speaker = GetSpeaker(speaker_name);
   if (!speaker) {
     PrintError("[InferencePipeline] Speaker not found: {}", speaker_name);
@@ -646,7 +667,7 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
                i + 1, segments.size(), segments[i]);
     
     auto audio = impl_->InferSegment(*speaker, segments[i], use_lang,
-                                     sample_config, noise_scale, speed);
+                                     sample_config, noise_scale, speed, stats);
     if (audio) {
       auto samples = audio->ReadSamples();
       

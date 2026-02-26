@@ -1,6 +1,7 @@
 #include "GPTSoVITS/EdgePipeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 
 #include "GPTSoVITS/Utils/LoudnessNormalizer.h"
@@ -116,7 +117,8 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     const std::string& text_lang,
     const Model::SampleConfig& sample_config,
     float noise_scale,
-    float speed) {
+    float speed,
+    Model::InferStats* stats) {
   auto iter = m_speaker_map.find(speaker_name);
   if (iter == m_speaker_map.end()) {
     PrintError("[EdgePipeline] Speaker '{}' not found", speaker_name);
@@ -313,6 +315,8 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     int consecutive_invalid_count = 0;
     const int max_consecutive_invalid = 10;
 
+    auto gpt_gen_start = std::chrono::steady_clock::now();
+
     for (int step = 0; step < max_steps; ++step) {
       bool step_ok = false;
       if (use_iobinding) {
@@ -381,6 +385,16 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
       idx->At<int64_t>(0)++;
     }
 
+    auto gpt_gen_end = std::chrono::steady_clock::now();
+    double gpt_gen_time_s = std::chrono::duration<double>(gpt_gen_end - gpt_gen_start).count();
+    PrintInfo("[EdgePipeline] GPT generation: {} tokens in {:.3f}s ({:.2f} tokens/s)",
+              generated_tokens.size(), gpt_gen_time_s,
+              generated_tokens.size() / gpt_gen_time_s);
+    if (stats) {
+      stats->gpt_tokens = static_cast<int>(generated_tokens.size());
+      stats->gpt_time_s = gpt_gen_time_s;
+    }
+
     // 检查是否有生成的 tokens
     if (generated_tokens.empty()) {
       PrintWarn("[EdgePipeline] No tokens generated, returning empty audio");
@@ -435,6 +449,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
         m_sovits_model->GetModel()->GetDevice(),
         m_sovits_model->GetModel()->GetInputDataType("sv_emb"));
 
+    auto t_sovits_start = std::chrono::steady_clock::now();
     auto audio_tensor = m_sovits_model->GenerateTensor(
         pred_semantic_final.get(),
         text_seq.get(),
@@ -442,6 +457,10 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
         sv_emb.get(),
         noise_scale,
         speed);
+    if (stats) {
+      stats->sovits_time_s += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_sovits_start).count();
+    }
 
     // 提取音频数据
     auto audio_cpu = audio_tensor->ToCPU();

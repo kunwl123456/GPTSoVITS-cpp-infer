@@ -101,6 +101,19 @@ struct SampleConfig {
   }
 };
 
+/**
+ * @brief 推理性能统计
+ */
+struct InferStats {
+  int    gpt_tokens     = 0;    // GPT 生成的 token 数
+  double gpt_time_s     = 0.0;  // GPT 自回归生成耗时（秒）
+  double sovits_time_s  = 0.0;  // SoVITS 解码耗时（秒）
+
+  double TokensPerSec() const {
+    return gpt_time_s > 0.0 ? gpt_tokens / gpt_time_s : 0.0;
+  }
+};
+
 }  // namespace GPTSoVITS::Model
 
 #endif  // GPT_SOVITS_CPP_SAMPLE_CONFIG_H

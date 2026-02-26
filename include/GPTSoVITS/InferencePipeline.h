@@ -253,7 +253,8 @@ public:
       const std::string& lang = "",
       const Model::SampleConfig& sample_config = {},
       float noise_scale = 0.5f,
-      float speed = 1.0f);
+      float speed = 1.0f,
+      Model::InferStats* stats = nullptr);
 
   /**
    * @brief 简化推理接口（使用默认参数）

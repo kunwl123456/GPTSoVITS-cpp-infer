@@ -19,6 +19,7 @@
 #include "GPTSoVITS/model/sv_embedding.h"
 #include "GPTSoVITS/model/ssl.h"
 #include "GPTSoVITS/model/vq.h"
+#include "GPTSoVITS/model/sample_config.h"
 
 
 namespace GPTSoVITS {
@@ -62,7 +63,16 @@ public:
                                            const std::string& text_lang = "zh",
                                            float temperature = 1.0f,
                                            float noise_scale = 0.5f,
-                                           float speed = 1.0f);
+                                           float speed = 1.0f,
+                                           Model::InferStats* stats = nullptr);
+
+  std::unique_ptr<AudioTools> InferSpeaker(const std::string& speaker_name,
+                                           const std::string& text,
+                                           const std::string& text_lang,
+                                           const Model::SampleConfig& sample_config,
+                                           float noise_scale = 0.5f,
+                                           float speed = 1.0f,
+                                           Model::InferStats* stats = nullptr);
 
   /**
    * @brief 导出说话人数据到文件

@@ -88,7 +88,8 @@ public:
       AudioChunkCallback callback,
       const Model::SampleConfig& sample_config,
       float noise_scale = 0.5f,
-      float speed = 1.0f);
+      float speed = 1.0f,
+      Model::InferStats* stats = nullptr);
 
   /**
    * @brief 设置流推理配置
@@ -123,7 +124,7 @@ private:
   /**
    * @brief 流式处理单个文本段落
    * 
-   * 核心流推理逻辑：边生成边解码
+   * 边生成边解码
    */
   std::vector<float> ProcessSegmentStreaming(
       const SpeakerInfo& speaker_info,
@@ -133,7 +134,8 @@ private:
       float temperature,
       float noise_scale,
       float speed,
-      const std::vector<float>& prev_fade_out);
+      const std::vector<float>& prev_fade_out,
+      Model::InferStats* stats = nullptr);
 
   /**
    * @brief 使用静音矩阵查找最佳分割点
@@ -164,7 +166,8 @@ private:
       const SpeakerInfo& speaker_info,
       const std::vector<int64_t>& target_phones,
       float noise_scale,
-      float speed);
+      float speed,
+      Model::InferStats* stats = nullptr);
 
   /**
    * @brief 应用淡入淡出

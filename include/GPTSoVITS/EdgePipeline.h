@@ -17,6 +17,7 @@
 #include "GPTSoVITS/model/sovits.h"
 
 namespace GPTSoVITS::Model {
+struct InferStats;
 struct SampleConfig;
 }
 
@@ -91,12 +92,14 @@ public:
    * @param sample_config 采样配置
    * @param noise_scale 噪声缩放
    * @param speed 速度
+   * @param stats 可选性能统计输出
    * @return 生成的音频
    */
   std::unique_ptr<AudioTools> InferSpeaker(
       const std::string& speaker_name, const std::string& text,
       const std::string& text_lang, const Model::SampleConfig& sample_config,
-      float noise_scale = 0.5f, float speed = 1.0f);
+      float noise_scale = 0.5f, float speed = 1.0f,
+      Model::InferStats* stats = nullptr);
 
   // ============ 流推理支持方法 ============
 

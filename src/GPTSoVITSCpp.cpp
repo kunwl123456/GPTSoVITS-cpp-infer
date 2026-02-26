@@ -3,6 +3,7 @@
 //
 #include "GPTSoVITS/GPTSoVITSCpp.h"
 
+#include <chrono>
 #include <numeric>
 #include <random>
 
@@ -191,7 +192,7 @@ const SpeakerInfo& GPTSoVITSPipline::CreateSpeaker(
 std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     const std::string& speaker_name, const std::string& text,
     const std::string& text_lang, float temperature, float noise_scale,
-    float speed) {
+    float speed, Model::InferStats* stats) {
   auto iter = m_speaker_map.find(speaker_name);
   if (iter == m_speaker_map.end()) {
     PrintError("Speaker not found: {}", speaker_name);
@@ -406,6 +407,7 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     int consecutive_invalid_count = 0;  // 连续无效输出计数
     const int max_consecutive_invalid = 10;  // 允许的最大连续无效次数
 
+    auto gpt_gen_start = std::chrono::steady_clock::now();
     for (int i = 0; i < max_steps; ++i) {
       auto idx_tensor = Model::Tensor::Empty({1}, Model::DataType::kInt64,
                                              Model::DeviceType::kCPU);
@@ -511,6 +513,17 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
       PrintWarn("GPT generation reached max_steps ({}) without EOS", max_steps);
     }
 
+    {
+      double gpt_time_s = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - gpt_gen_start).count();
+      PrintInfo("[GPTSoVITSPipline] GPT generation: {} tokens in {:.3f}s ({:.2f} tokens/s)",
+                steps, gpt_time_s, steps / gpt_time_s);
+      if (stats) {
+        stats->gpt_tokens += steps;
+        stats->gpt_time_s += gpt_time_s;
+      }
+    }
+
     // Concatenate all semantic tokens (确保全在CPU上，以便处理)
     std::vector<std::unique_ptr<Model::Tensor>> semantic_cpu_list;
     std::vector<Model::Tensor*> semantic_ptrs;
@@ -568,9 +581,14 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
 
     // 生成音频
     PrintDebug("  SoVITS decoding...");
+    auto t_sovits_start = std::chrono::steady_clock::now();
     auto audio_output = m_sovits_model->GenerateTensor(
         generated_sem.get(), text_seq_tensor.get(), refer_spec_reshaped.get(),
         sv_emb_reshaped.get(), noise_scale, speed);
+    if (stats) {
+      stats->sovits_time_s += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_sovits_start).count();
+    }
 
     if (audio_output && audio_output->ElementCount() > 0) {
       auto audio_cpu = audio_output->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
@@ -627,6 +645,14 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     PrintWarn("Generated empty audio");
     return AudioTools::FromEmpty(m_config_params.sampling_rate);
   }
+}
+
+std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
+    const std::string& speaker_name, const std::string& text,
+    const std::string& text_lang, const Model::SampleConfig& sample_config,
+    float noise_scale, float speed, Model::InferStats* stats) {
+  return InferSpeaker(speaker_name, text, text_lang,
+                      sample_config.temperature, noise_scale, speed, stats);
 }
 
 int64_t GPTSoVITSPipline::SampleTopK(const Model::Tensor* topk_values,

@@ -4,6 +4,8 @@
 
 #include "GPTSoVITS/StreamingPipeline.h"
 
+#include <chrono>
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -41,7 +43,8 @@ bool StreamingPipeline::InferSpeakerStreaming(
     AudioChunkCallback callback,
     const Model::SampleConfig& sample_config,
     float noise_scale,
-    float speed) {
+    float speed,
+    Model::InferStats* stats) {
   if (!m_edge_pipeline->HasSpeaker(speaker_name)) {
     PrintError("[StreamingPipeline] Speaker '{}' not found", speaker_name);
     return false;
@@ -114,7 +117,7 @@ bool StreamingPipeline::InferSpeakerStreaming(
     // 流式处理段落
     prev_fade_out = ProcessSegmentStreaming(
         *speaker_info, segment, seg_idx, callback,
-        sample_config.temperature, noise_scale, speed, prev_fade_out);
+        sample_config.temperature, noise_scale, speed, prev_fade_out, stats);
 
     // 添加段落间停顿
     if (seg_idx < segments.size() - 1 && m_config.pause_length > 0) {
@@ -149,7 +152,8 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     float temperature,
     float noise_scale,
     float speed,
-    const std::vector<float>& prev_fade_out) {
+    const std::vector<float>& prev_fade_out,
+    Model::InferStats* stats) {
   
   auto gpt_encoder_model = m_edge_pipeline->GetGPTEncoderModel();
   auto gpt_step_model = m_edge_pipeline->GetGPTStepModel();
@@ -297,7 +301,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     // 解码
     auto audio_data = DecodeChunk(
         chunk_tokens, history_tokens, lookahead_tokens,
-        speaker_info, target_phones, noise_scale, speed);
+        speaker_info, target_phones, noise_scale, speed, stats);
 
     if (audio_data.empty()) {
       return;
@@ -366,6 +370,8 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   // GPT Step 自回归生成
   int consecutive_invalid_count = 0;
   const int max_consecutive_invalid = 10;
+
+  auto gpt_gen_start = std::chrono::steady_clock::now();
 
   for (int step = 0; step < max_steps; ++step) {
     // GPT Step
@@ -487,6 +493,18 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     }
   }
 
+  {
+    auto gpt_gen_end = std::chrono::steady_clock::now();
+    double gpt_gen_time_s = std::chrono::duration<double>(gpt_gen_end - gpt_gen_start).count();
+    PrintInfo("[StreamingPipeline] GPT generation: {} tokens in {:.3f}s ({:.2f} tokens/s)",
+              generated_tokens.size(), gpt_gen_time_s,
+              generated_tokens.size() / gpt_gen_time_s);
+    if (stats) {
+      stats->gpt_tokens += static_cast<int>(generated_tokens.size());
+      stats->gpt_time_s += gpt_gen_time_s;
+    }
+  }
+
   // 处理剩余的tokens
   if (token_counter > 0) {
     std::vector<int64_t> remaining_tokens(
@@ -514,7 +532,8 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     const SpeakerInfo& speaker_info,
     const std::vector<int64_t>& target_phones,
     float noise_scale,
-    float speed) {
+    float speed,
+    Model::InferStats* stats) {
 
   if (chunk_tokens.empty()) {
     return {};
@@ -614,6 +633,7 @@ std::vector<float> StreamingPipeline::DecodeChunk(
   PrintDebug("[StreamingPipeline::DecodeChunk] Tensor conversion done, calling GenerateTensor...");
 
   // SoVITS 推理
+  auto t_sovits_start = std::chrono::steady_clock::now();
   auto audio_tensor = sovits_model->GenerateTensor(
       pred_semantic_final.get(),
       text_seq_final.get(),
@@ -621,6 +641,10 @@ std::vector<float> StreamingPipeline::DecodeChunk(
       sv_emb_final.get(),
       noise_scale,
       speed);
+  if (stats) {
+    stats->sovits_time_s += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_sovits_start).count();
+  }
 
   PrintDebug("[StreamingPipeline::DecodeChunk] GenerateTensor returned");
 
