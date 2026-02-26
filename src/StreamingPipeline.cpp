@@ -489,7 +489,10 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
       auto chunk_to_decode = std::move(chunk_queue.front());
       chunk_queue.pop_front();
       const std::vector<int64_t>* lookahead_ptr = chunk_queue.empty() ? nullptr : &chunk_queue.front();
+      auto t_pause = std::chrono::steady_clock::now();
       decode_and_yield(chunk_to_decode, lookahead_ptr, false);
+      // 把 decode 耗时从 gpt_gen_start 里扣除
+      gpt_gen_start += std::chrono::steady_clock::now() - t_pause;
     }
   }
 
