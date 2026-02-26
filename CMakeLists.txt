@@ -359,6 +359,15 @@ if(DEFINED ONNXRUNTIME_PATH)
 endif()
 
 
+function(target_copy_res _target)
+  add_custom_command(TARGET ${_target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CMAKE_SOURCE_DIR}/res"
+          "$<TARGET_FILE_DIR:${_target}>/res"
+      COMMENT "[Post-Build] Copying res/ -> $<TARGET_FILE_DIR:${_target}>/res"
+  )
+endfunction()
+
 if (NOT NO_TEST)
   include(example/example_all.cmake)
 endif ()

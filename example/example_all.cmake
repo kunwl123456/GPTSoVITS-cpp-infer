@@ -25,6 +25,16 @@ if(USE_ONNX)
 endif ()
 
 
+target_copy_res(gpt_sovits_cpp_test_clean_text)
+target_copy_res(gpt_sovits_cpp_test_bert)
+
+if(USE_ONNX)
+  target_copy_res(gpt_sovits_cpp_cloud_create_onnx)
+  target_copy_res(gpt_sovits_cpp_edge_inference_onnx)
+  target_copy_res(gpt_sovits_cpp_multi_speaker_onnx)
+  target_copy_res(gpt_sovits_cpp_streaming_onnx)
+endif()
+
 if (WIN32 AND COMMAND auto_copy_backend_dlls)
   auto_copy_backend_dlls(gpt_sovits_cpp_test_clean_text)
   auto_copy_backend_dlls(gpt_sovits_cpp_test_bert)

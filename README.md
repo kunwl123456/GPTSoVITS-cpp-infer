@@ -1,1 +1,284 @@
-> C++绑定编写中,上游源项目请前往 [GPT-SoVITS_minimal_inference](https://github.com/GPT-SoVITS-Devel/GPT-SoVITS_minimal_inference) 预览
+<div align="center">
+
+# ⚡ GPT-SoVITS C++ SDK
+
+**Production-Grade | Zero-Copy | Multi-Language Binding**
+
+[![License](https://img.shields.io/badge/license-apache-blue.svg)](LICENSE)
+[![C++](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
+[![GPU](https://img.shields.io/badge/CUDA-12.6+-orange.svg)](https://developer.nvidia.com/cuda-zone)
+[![ONNX](https://img.shields.io/badge/ONNX-Optimized-brightgreen.svg)](https://onnxruntime.ai/)
+[![TensorRT](https://img.shields.io/badge/TensorRT-Planned-76B900.svg)](https://developer.nvidia.com/tensorrt)
+
+[简体中文](./README_zh.md) | [English](./README.md)
+
+**"Python was the prototype. C++ is the weapon."**
+
+---
+
+The production inference engine for [GPT-SoVITS Minimal Inference](https://github.com/GPT-SoVITS-Devel/GPT-SoVITS_minimal_inference).
+The Python repo handles model export and tech preview. This repo is where the real work happens.
+
+</div>
+
+---
+
+## 🌟 Core Vision
+
+The Python project proved the concept. Now we're done being polite about performance.
+
+This C++ SDK takes every optimization from the Python pipeline — KV-Cache pre-allocation, IOBinding zero-copy, lookahead streaming — and removes the last remaining bottleneck: **the Python interpreter itself**.
+
+Goals: **Faster 🏎️**, **Embeddable 🔩**, **Bindable to Everything 🌍**, **No Runtime Tax 💀**.
+
+---
+
+## 🚀 Performance Benchmarks
+
+*Environment: I7 12700 | RTX 2080TI (22G) | CUDA 12.9 | FP16 Precision*
+
+*Test text: multilingual ZH/JA/EN mixed, ~19s audio output*
+
+| Metric                        | Python ONNX  | **C++ Edge**     | Python ONNX Stream | **C++ Streaming** |
+|:------------------------------|:-------------|:-----------------|:-------------------|:------------------|
+| **Inference Speed (↑)**       | 172.4 tok/s  | **215.1 tok/s**  | 167.5 tok/s        | **198.6 tok/s**   |
+| **RTF (↓)**                   | 0.3325       | **0.2398**       | 0.3100             | 0.4894            |
+| **First Packet Latency (↓)**  | 2.683 s      | **1.210 s**      | **1.000 s**        | 1.250 s           |
+| **VRAM Usage**                | 3.9 G        | 3.6 G            | 4.5 G              | 4.0 G             |
+
+> C++ Edge vs Python ONNX: **+24.8% throughput**, **-27.9% RTF**, **-54.9% first-packet latency**.
+
+---
+
+## 🏗️ Architecture
+
+This SDK implements a **distributed inference model** — speaker creation and inference are decoupled:
+
+```
+[Cloud / Offline]                    [Edge / Production]
+  Reference Audio                      .gsppkg file
+       ↓                                    ↓
+  CreateSpeaker()              →    ImportSpeaker()
+  ExportSpeaker(.gsppkg)                    ↓
+                                      Infer() / InferStreaming()
+                                            ↓
+                                       Audio Output
+```
+
+### Pipeline Modes
+
+| Mode | Description |
+|:-----|:------------|
+| **Edge Pipeline** | Inference only. Loads speaker from `.gsppkg`. Minimal VRAM. |
+| **Streaming Pipeline** | Chunk-based real-time generation with crossfade. |
+| **Full Pipeline** | Speaker creation + inference. For most scenarios. |
+
+### Model Stack
+
+```
+CNBertModel      → Phoneme + BERT features
+GPTEncoderModel  → Context encoding (one-shot)
+GPTStepModel     → Autoregressive decoding (O(1) per step, KV-cache)
+SoVITSModel      → Neural vocoder → PCM audio
+```
+
+---
+
+## 🏁 Quick Start
+
+### Prerequisites
+
+- CMake 3.20+
+- ONNX Runtime 1.16+ (CUDA build for GPU)
+- CUDA 12.6+ (optional, for GPU)
+
+### Build
+
+```bash
+# CPU build
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+
+# CUDA build (recommended)
+cmake -B build -S . \
+  -DENABLE_STATIC_RUNTIME=1 \
+  -DONNXRUNTIME_PATH=/path/to/onnxruntime \
+  -DENABLE_CUDA=1 \
+  -DCUDNN_PATH=/path/to/cudnn \
+  -DCUDA_TOOLKIT_ROOT_DIR=/path/to/cuda
+cmake --build build --config Release
+```
+
+### Step 1 — Export Model (Python side)
+
+```bash
+# In GPT-SoVITS_minimal_inference repo
+python export_onnx.py \
+    --gpt_path "pretrained_models/GPT_weights_v2ProPlus/your_model.ckpt" \
+    --sovits_path "pretrained_models/SoVITS_weights_v2ProPlus/your_model.pth" \
+    --cnhubert_base_path pretrained_models/chinese-hubert-base \
+    --bert_path pretrained_models/chinese-roberta-wwm-ext-large \
+    --output_dir "onnx_export/my_model_fp16" \
+    --max_len 1000 \
+    --validate \
+    --validation_device cuda
+```
+
+### Step 2 — Create Speaker Package
+
+```bash
+./build/gpt_sovits_cpp_cloud_create_onnx \
+    --ref-audio ref.wav \
+    --ref-text "参考文本" \
+    --lang zh \
+    --speaker-name my_speaker \
+    --output my_speaker.gsppkg
+```
+
+### Step 3 — Run Inference
+
+```bash
+# Distributed (edge) inference
+./build/gpt_sovits_cpp_edge_inference_onnx \
+    --speaker-package my_speaker.gsppkg \
+    --text "要合成的文本" \
+    --output output.wav
+
+# Streaming inference
+./build/gpt_sovits_cpp_streaming_onnx \
+    --speaker-package my_speaker.gsppkg \
+    --text "要合成的文本" \
+    --chunk-length 24 \
+    --output output.wav
+```
+
+---
+
+## 🔧 C++ API Usage
+
+### Create & Export Speaker
+
+```cpp
+#include "GPTSoVITS/InferencePipeline.h"
+
+// Full mode: loads all models including speaker creation models
+GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Full(
+    "/path/to/model", GPTSoVITS::Model::DeviceType::kCUDA, 0);
+config.resources_path = "./res";
+
+GPTSoVITS::InferencePipeline pipeline(config);
+
+// Create speaker from reference audio
+pipeline.CreateSpeaker("my_speaker", "zh", "ref.wav", "参考文本");
+
+// Export to portable package
+pipeline.ExportSpeaker("my_speaker", "my_speaker.gsppkg");
+```
+
+### Import Speaker
+
+```cpp
+// Edge mode: inference only, no creation models loaded
+GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Edge(
+    "/path/to/model", GPTSoVITS::Model::DeviceType::kCUDA, 0);
+config.resources_path = "./res";
+
+GPTSoVITS::InferencePipeline pipeline(config);
+pipeline.ImportSpeaker("my_speaker.gsppkg", "my_speaker");  // second arg: rename (optional)
+```
+
+### Edge Inference
+
+```cpp
+GPTSoVITS::Model::SampleConfig sample_config;
+sample_config.temperature = 1.0f;
+sample_config.top_k       = 40;
+sample_config.top_p       = 0.6f;
+
+GPTSoVITS::Model::InferStats stats;
+double first_latency_ms = 0.0;
+
+auto audio = pipeline.Infer(
+    "my_speaker", "要合成的文本", "zh",
+    sample_config, /*noise_scale=*/0.35f, /*speed=*/1.0f,
+    &stats,
+    [&]() {  // fires after first segment is ready
+        first_latency_ms = /* elapsed since infer start */;
+    });
+
+audio->SaveToFile("output.wav");
+// stats.TokensPerSec(), stats.gpt_time_s, stats.sovits_time_s
+```
+
+### Streaming Inference
+
+```cpp
+#include "GPTSoVITS/EdgePipeline.h"
+#include "GPTSoVITS/StreamingPipeline.h"
+
+// Build EdgePipeline (shared models, can serve multiple StreamingPipelines)
+auto edge = std::make_shared<GPTSoVITS::EdgePipeline>(config_json, model_path,
+                                                       g2p, enc, step, sovits);
+edge->ImportSpeaker("my_speaker.gsppkg", "my_speaker");
+
+GPTSoVITS::StreamingConfig stream_cfg;
+stream_cfg.chunk_length = 24;    // tokens per chunk
+stream_cfg.pause_length = 0.3f;  // silence between sentences (s)
+stream_cfg.h_len        = 512;   // history tokens for crossfade
+stream_cfg.l_len        = 16;    // lookahead tokens for crossfade
+stream_cfg.enable_fade  = true;
+
+auto streaming = std::make_shared<GPTSoVITS::StreamingPipeline>(edge, stream_cfg);
+
+GPTSoVITS::Model::InferStats stats;
+streaming->InferSpeakerStreaming(
+    "my_speaker", "要合成的文本", "zh",
+    [](const GPTSoVITS::AudioChunk& chunk) {
+        // chunk.audio_data  — PCM float32 samples
+        // chunk.duration    — seconds
+        // chunk.is_first / chunk.is_last
+        // feed to audio device or accumulate
+    },
+    /*sample_config=*/{}, /*noise_scale=*/0.35f, /*speed=*/1.0f,
+    &stats);
+```
+
+---
+
+## 💎 Key Optimizations
+
+### 1. IOBinding Zero-Copy (KV-Cache)
+ONNX Runtime IOBinding keeps KV-cache tensors resident in VRAM across every autoregressive step. No PCIe round-trips, no `cudaMemcpy` per token.
+
+### 2. Ping-Pong Cache Buffers
+Pre-allocated `k_cache` / `v_cache` output buffers. Each step swaps pointers — zero allocation in the hot loop.
+
+### 3. Artifact-Free Streaming
+Lookahead + history window with linear crossfade at chunk boundaries. No clicks, no pops, even at aggressive chunk sizes.
+
+---
+
+## 🗺️ Roadmap
+
+- [x] **ONNX Runtime** backend (CPU + CUDA)
+- [x] **Distributed inference** (speaker package workflow)
+- [x] **Streaming inference** with crossfade
+- [x] **Multi-language G2P** (ZH / EN / JA)
+- [x] **InferStats** — tokens/s, RTF, first-packet latency
+- [ ] **TensorRT** backend
+- [ ] **INT8** quantization
+- [ ] **Language Bindings**:
+    - [ ] C API
+    - [ ] Python binding
+    - [ ] Rust binding
+    - [ ] Go binding
+    - [ ] Android / iOS wrapper
+    - (... more bindings)
+
+---
+
+## 🤝 Acknowledgments
+
+Built on top of [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) and the engineering work in [GPT-SoVITS_minimal_inference](https://github.com/GPT-SoVITS-Devel/GPT-SoVITS_minimal_inference).
+
+**If this project helps you, drop a ⭐. It's free and it means a lot. 🤗**
