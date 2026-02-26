@@ -170,13 +170,13 @@ int64_t Sampler::SampleZeroCopy(
   } else {
 #ifdef WITH_CUDA
     cudaError_t err = cudaMemcpy(
-        cpu_buffer, logits_gpu->Data<float>(), 
+        cpu_buffer, logits_gpu->Data<float>(),
         size * sizeof(float), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
       PrintError("[Sampler] D2H copy failed: {}", cudaGetErrorString(err));
       return 0;
     }
-    cudaDeviceSynchronize();
+    cudaStreamSynchronize(nullptr);
 #else
     // 无CUDA支持，使用ToCPU
     auto cpu_tensor = logits_gpu->ToCPU();
@@ -351,25 +351,19 @@ int64_t SampleTopK(
     }
   }
   
-  // 全局 RNG 多项式采样
-  try {
-    auto& rng = GetGlobalRNG();
-    std::discrete_distribution<int> dist(probs.begin(), probs.begin() + k);
-    int choice = dist(rng);
-    return indices_ptr[choice];
-  } catch (const std::exception& e) {
-    PrintError("[SampleTopK] discrete_distribution failed: {}", e.what());
-    // Fallback: argmax
-    int max_idx = 0;
-    float max_prob = probs[0];
-    for (int64_t i = 1; i < k; ++i) {
-      if (probs[i] > max_prob) {
-        max_prob = probs[i];
-        max_idx = static_cast<int>(i);
-      }
+  // 手动 CDF 采样，复用线程局部 probs buffer，避免 discrete_distribution 每步堆分配
+  auto& rng = GetGlobalRNG();
+  std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+  float r = uniform(rng);
+  float cdf = 0.0f;
+  for (int64_t i = 0; i < k; ++i) {
+    cdf += probs[i];
+    if (r <= cdf) {
+      return indices_ptr[i];
     }
-    return indices_ptr[max_idx];
   }
+  // 浮点累积误差 fallback 返回最后一个
+  return indices_ptr[k - 1];
 }
 
 }  // namespace Utils

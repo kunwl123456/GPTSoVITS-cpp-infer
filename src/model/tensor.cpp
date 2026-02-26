@@ -181,9 +181,9 @@ std::unique_ptr<Tensor> Tensor::ToDevice(Device device) const {
 #ifdef WITH_CUDA
     cudaError_t err = cudaMemcpy(new_tensor->Data(), Data(), bytes, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) THROW_ERRORN("D2H copy failed: {}", cudaGetErrorString(err));
-    // D2H 拷贝后必须同步，确保数据传输完成
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) THROW_ERRORN("D2H sync failed: {}", cudaGetErrorString(err));
+    // D2H 同步默认流
+    err = cudaStreamSynchronize(nullptr);
+    if (err != cudaSuccess) THROW_ERRORN("D2H stream sync failed: {}", cudaGetErrorString(err));
 #else
     THROW_ERRORN("CUDA support is not enabled.");
 #endif
@@ -230,7 +230,8 @@ std::unique_ptr<Tensor> Tensor::ToType(DataType dtype) const {
       return cpu_dst->ToDevice(device_);
     }
 
-    cudaDeviceSynchronize();
+    // 同步默认流
+    cudaStreamSynchronize(nullptr);
     return dst;
 #else
     // 无 CUDA 支持，回退到 CPU 转换

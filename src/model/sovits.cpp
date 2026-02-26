@@ -63,7 +63,7 @@ std::unique_ptr<Tensor> SoVITSModel::GenerateTensor(Tensor* pred_semantic,
   inputs["text_seq"] = text_seq_ptr;
   inputs["refer_spec"] = refer_spec_ptr;
 
-  auto input_names = m_model->GetInputNames();
+  const auto& input_names = m_model->GetInputNames();
   auto has_input = [&](const std::string& name) {
     return std::find(input_names.begin(), input_names.end(), name) !=
            input_names.end();
@@ -72,26 +72,35 @@ std::unique_ptr<Tensor> SoVITSModel::GenerateTensor(Tensor* pred_semantic,
   // Optional: sv_emb
   std::unique_ptr<Tensor> sv_emb_tensor;
   if (has_input("sv_emb") && sv_emb) {
-    sv_emb_tensor = sv_emb->To(model_device, m_model->GetInputDataType("sv_emb"));
-    inputs["sv_emb"] = sv_emb_tensor.get();
+    if (sv_emb->GetDeviceType() != model_device.type ||
+        sv_emb->Type() != m_model->GetInputDataType("sv_emb")) {
+      sv_emb_tensor = sv_emb->To(model_device, m_model->GetInputDataType("sv_emb"));
+      inputs["sv_emb"] = sv_emb_tensor.get();
+    } else {
+      inputs["sv_emb"] = sv_emb;
+    }
   }
 
   // Optional: noise_scale
-  std::unique_ptr<Tensor> noise_scale_tensor;
   if (has_input("noise_scale")) {
-    auto noise_scale_cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
-    noise_scale_cpu->At<float>(0) = noise_scale;
-    noise_scale_tensor = noise_scale_cpu->To(model_device, m_model->GetInputDataType("noise_scale"));
-    inputs["noise_scale"] = noise_scale_tensor.get();
+    if (!m_noise_scale_tensor || m_cached_noise_scale != noise_scale) {
+      auto cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
+      cpu->At<float>(0) = noise_scale;
+      m_noise_scale_tensor = cpu->To(model_device, m_model->GetInputDataType("noise_scale"));
+      m_cached_noise_scale = noise_scale;
+    }
+    inputs["noise_scale"] = m_noise_scale_tensor.get();
   }
 
-  // Optional: speed
-  std::unique_ptr<Tensor> speed_tensor;
+  // Optional: speed — 同上
   if (has_input("speed")) {
-    auto speed_cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
-    speed_cpu->At<float>(0) = speed;
-    speed_tensor = speed_cpu->To(model_device, m_model->GetInputDataType("speed"));
-    inputs["speed"] = speed_tensor.get();
+    if (!m_speed_tensor || m_cached_speed != speed) {
+      auto cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
+      cpu->At<float>(0) = speed;
+      m_speed_tensor = cpu->To(model_device, m_model->GetInputDataType("speed"));
+      m_cached_speed = speed;
+    }
+    inputs["speed"] = m_speed_tensor.get();
   }
 
   // Run inference
@@ -102,9 +111,10 @@ std::unique_ptr<Tensor> SoVITSModel::GenerateTensor(Tensor* pred_semantic,
   // 确保所有 CUDA 操作完成后再返回
   // 避免调用者访问数据时 CUDA 内核仍在执行导致访问违规
   if (model_device.type == DeviceType::kCUDA) {
-    cudaError_t err = cudaDeviceSynchronize();
+    // 同步默认流
+    cudaError_t err = cudaStreamSynchronize(nullptr);
     if (err != cudaSuccess) {
-      PrintError("[SoVITS] cudaDeviceSynchronize failed: {}", cudaGetErrorString(err));
+      PrintError("[SoVITS] cudaStreamSynchronize failed: {}", cudaGetErrorString(err));
     }
   }
 #endif

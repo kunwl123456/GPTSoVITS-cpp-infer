@@ -32,8 +32,8 @@ public:
   bool ForwardWithPreallocatedOutput(
       const std::unordered_map<std::string, Tensor*>& inputs,
       std::unordered_map<std::string, Tensor*>& outputs) override;
-  std::vector<std::string> GetInputNames() const override;
-  std::vector<std::string> GetOutputNames() const override;
+  const std::vector<std::string>& GetInputNames() const override;
+  const std::vector<std::string>& GetOutputNames() const override;
   DataType GetInputDataType(const std::string& name) const override;
   DataType GetOutputDataType(const std::string& name) const override;
 

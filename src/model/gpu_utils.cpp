@@ -189,7 +189,7 @@ std::unique_ptr<Tensor> GPUSampler::SampleTopK(
       }
 
       // 同步等待kernel完成
-      cudaDeviceSynchronize();
+      cudaStreamSynchronize(nullptr);
 
       // 将 softmax 后的值和索引拷贝到 CPU 进行采样
       auto values_cpu = softmax_values->ToCPU();
@@ -246,7 +246,7 @@ std::unique_ptr<Tensor> GPUTypeConverter::ConvertType(
       }
 
       // 同步等待kernel完成
-      cudaDeviceSynchronize();
+      cudaStreamSynchronize(nullptr);
 
       return dst;
     } catch (const std::exception& e) {

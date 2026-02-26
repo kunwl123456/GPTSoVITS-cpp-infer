@@ -71,7 +71,7 @@ void PrecisionContext::DetectFromModel(Model::BaseModel* model) {
   }
   
   // 获取输入名称列表
-  auto input_names = model->GetInputNames();
+  const auto& input_names = model->GetInputNames();
   std::unordered_map<std::string, std::string> input_types;
   
   for (const auto& name : input_names) {

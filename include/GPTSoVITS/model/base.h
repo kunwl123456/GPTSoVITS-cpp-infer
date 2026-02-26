@@ -71,12 +71,12 @@ public:
   /**
    * @brief Get input names
    */
-  virtual std::vector<std::string> GetInputNames() const = 0;
+  virtual const std::vector<std::string>& GetInputNames() const = 0;
 
   /**
    * @brief Get output names
    */
-  virtual std::vector<std::string> GetOutputNames() const = 0;
+  virtual const std::vector<std::string>& GetOutputNames() const = 0;
 
   /**
    * @brief Get input data type

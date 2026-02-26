@@ -17,6 +17,8 @@ namespace GPTSoVITS::Model {
 struct ONNXBackend::Impl {
   Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "gsv_cpp_bert"};
   std::unique_ptr<Ort::Session> session;
+  // 缓存 IoBinding
+  std::unique_ptr<Ort::IoBinding> io_binding;
   std::vector<std::string> input_names;
   std::vector<std::string> output_names;
   std::unordered_map<std::string, DataType> input_types;
@@ -73,7 +75,9 @@ std::vector<std::unique_ptr<Tensor>> ONNXBackend::InferCore(
   const std::unordered_map<std::string, Tensor*>& inputs,
   const std::vector<std::string>& target_output_names) {
 
-  Ort::IoBinding io_binding(*impl->session);
+  Ort::IoBinding& io_binding = *impl->io_binding;
+  io_binding.ClearBoundInputs();
+  io_binding.ClearBoundOutputs();
 
   // bind
   for (auto const& [name, tensor] : inputs) {
@@ -146,15 +150,16 @@ std::vector<std::unique_ptr<Tensor>> ONNXBackend::InferCore(
       auto new_tensor = Tensor::Empty(shape, dtype, res_device);
       void* src_ptr = val.GetTensorMutableData<void>();
       size_t bytes = new_tensor->ByteSize();
-      cudaError_t err = cudaMemcpy(new_tensor->Data(), src_ptr, bytes, cudaMemcpyDeviceToDevice);
+      cudaError_t err = cudaMemcpyAsync(new_tensor->Data(), src_ptr, bytes,
+                                        cudaMemcpyDeviceToDevice, 0);
       if (err != cudaSuccess) {
         PrintError("[ONNXBackend] Failed to copy CUDA output: {}", cudaGetErrorString(err));
         throw std::runtime_error(cudaGetErrorString(err));
       }
-      // 同步确保拷贝完成
-      err = cudaDeviceSynchronize();
+      // 同步默认流
+      err = cudaStreamSynchronize(nullptr);
       if (err != cudaSuccess) {
-        PrintError("[ONNXBackend] CUDA sync failed: {}", cudaGetErrorString(err));
+        PrintError("[ONNXBackend] CUDA stream sync failed: {}", cudaGetErrorString(err));
       }
       output_tensors.push_back(std::move(new_tensor));
 #else
@@ -241,6 +246,9 @@ bool ONNXBackend::Load(const std::string& model_path, const BackendConfig& confi
           FromOnnxType(tensor_info.GetElementType());
     }
 
+    // 初始化缓存的 IoBinding，避免热循环中每步重建
+    impl_->io_binding = std::make_unique<Ort::IoBinding>(*impl_->session);
+
     PrintInfo("[ONNXBackend] Loaded model from: {}", model_path);
     PrintInfo("[ONNXBackend] Device: {}, Precision: {}, Threads: {}",
               (config_.device.type == DeviceType::kCUDA ? "CUDA" : "CPU"),
@@ -318,11 +326,11 @@ void ONNXBackend::Forward(const std::unordered_map<std::string, Tensor*>& inputs
   outputs = std::move(result_list);
 }
 
-std::vector<std::string> ONNXBackend::GetInputNames() const {
+const std::vector<std::string>& ONNXBackend::GetInputNames() const {
   return impl_->input_names;
 }
 
-std::vector<std::string> ONNXBackend::GetOutputNames() const {
+const std::vector<std::string>& ONNXBackend::GetOutputNames() const {
   return impl_->output_names;
 }
 
@@ -343,7 +351,10 @@ bool ONNXBackend::ForwardWithPreallocatedOutput(
     const std::unordered_map<std::string, Tensor*>& inputs,
     std::unordered_map<std::string, Tensor*>& outputs) {
   try {
-    Ort::IoBinding io_binding(*impl_->session);
+    // 复用缓存的 IoBinding
+    Ort::IoBinding& io_binding = *impl_->io_binding;
+    io_binding.ClearBoundInputs();
+    io_binding.ClearBoundOutputs();
 
     // 绑定输入
     for (auto const& [name, tensor] : inputs) {

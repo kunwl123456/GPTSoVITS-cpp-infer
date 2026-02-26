@@ -268,15 +268,14 @@ public:
     }
 
     // 准备 phoneme_ids
-    auto phoneme_ids = all_phones->To(Model::Device(Model::DeviceType::kCPU),
-                                      Model::DataType::kInt64);
+    auto phoneme_ids = std::move(all_phones);
     if (phoneme_ids->Shape().size() == 1) {
       phoneme_ids->Reshape({1, phoneme_ids->Shape()[0]});
     }
 
     // 准备 prompts
-    auto prompts = vq_codes->To(Model::Device(Model::DeviceType::kCPU),
-                                Model::DataType::kInt64);
+    auto prompt_dtype = gpt_encoder->GetModel()->GetInputDataType("prompts");
+    auto prompts = vq_codes->To(target_device, prompt_dtype);
     if (prompts->Shape().size() == 1) {
       prompts->Reshape({1, prompts->Shape()[0]});
     }

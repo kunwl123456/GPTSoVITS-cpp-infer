@@ -329,7 +329,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     history_tokens.insert(history_tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
     if (history_tokens.size() > static_cast<size_t>(m_config.h_len)) {
       history_tokens.erase(
-          history_tokens.begin(), 
+          history_tokens.begin(),
           history_tokens.begin() + (history_tokens.size() - m_config.h_len));
     }
 
