@@ -287,6 +287,7 @@ _g2p_en(const std::string &segments) {
     prons.insert(prons.end(), pron.begin(), pron.end());
     prons.emplace_back(" ");
   }
+  if (prons.empty()) return {{}, {}};
   return {std::vector<std::string>(prons.begin(), prons.end() - 1), {}};
 }
 

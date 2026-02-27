@@ -10,6 +10,8 @@
 
 #include "GPTSoVITS/model/base.h"
 #include "GPTSoVITS/model/tensor.h"
+#include "GPTSoVITS/Utils/exception.h"
+#include "GPTSoVITS/model/backend/backend_config.h"
 
 namespace GPTSoVITS::Model {
 
@@ -53,7 +55,9 @@ public:
             const Device& device = DeviceType::kCPU,
             int work_thread_num = 1) {
     m_model = std::make_unique<MODEL_BACKEND>();
-    m_model->Load(model_path, device, work_thread_num);
+    if (!m_model->Load(model_path, device, work_thread_num)) {
+      THROW_ERRORN("Failed to load GPTStepModel from: {}", model_path);
+    }
 
     // Detect cache data type
     auto input_names = m_model->GetInputNames();
@@ -63,8 +67,24 @@ public:
       }
     }
 
-    // ONNX backend supports ForwardWithPreallocatedOutput,
-    // enabling zero-copy ping-pong cache reuse in the step loop
+    m_supports_iobinding = true;
+  }
+
+  template <typename MODEL_BACKEND>
+  void Init(const std::string& model_path, const BackendConfig& config) {
+    m_model = std::make_unique<MODEL_BACKEND>();
+    if (!m_model->Load(model_path, config)) {
+      THROW_ERRORN("Failed to load GPTStepModel from: {}", model_path);
+    }
+
+    // Detect cache data type
+    auto input_names = m_model->GetInputNames();
+    for (const auto& name : input_names) {
+      if (name == "k_cache" || name == "v_cache") {
+        m_cache_dtype = m_model->GetInputDataType(name);
+      }
+    }
+
     m_supports_iobinding = true;
   }
 

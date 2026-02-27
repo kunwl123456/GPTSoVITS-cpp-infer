@@ -3,9 +3,8 @@
 //
 #include "GPTSoVITS/InferencePipeline.h"
 
-#include <chrono>
-
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <numeric>
 #include <random>
@@ -24,7 +23,9 @@
 #include "GPTSoVITS/Utils/speaker_serializer.h"
 #include "GPTSoVITS/model/CNBertModel.h"
 #include "GPTSoVITS/model/backend/onnx_backend.h"
+#include "GPTSoVITS/model/backend/tensorrt_backend.h"
 #include "GPTSoVITS/plog.h"
+#include "fmt/xchar.h"
 #include "nlohmann/json.hpp"
 namespace GPTSoVITS {
 // JSON 配置实现
@@ -151,6 +152,20 @@ public:
                                     config.model_path, device,
                                     config.compute_precision);
     }
+    if (config.backend != Model::BackendType::kAuto
+        || !config.engine_cache_dir.empty()) {
+      auto group = config.mode == PipelineMode::kFull
+                       ? Model::ModelGroup::kAll
+                       : Model::ModelGroup::kInference;
+      for (auto type : Model::GetModelTypesInGroup(group)) {
+        model_pool.UpdateConfig(type, [&](Model::ModelConfig& cfg) {
+          if (config.backend != Model::BackendType::kAuto)
+            cfg.backend = config.backend;
+          if (!config.engine_cache_dir.empty())
+            cfg.engine_cache_dir = config.engine_cache_dir;
+        });
+      }
+    }
     // 预加载模型
     if (config.mode == PipelineMode::kFull) {
       model_pool.PreloadModelGroup(Model::ModelGroup::kAll);
@@ -164,13 +179,27 @@ public:
         config.resources_path.empty()
             ? std::filesystem::current_path() / "res"
             : std::filesystem::path(config.resources_path);
-    // BERT 模型
+    // BERT
     auto bert_model = std::make_unique<Model::CNBertModel>();
-    auto bert_path = std::filesystem::path(config.model_path) / "bert.onnx";
-    auto tokenizer_path = resources_path / "bert_tokenizer.json";
+    auto bert_onnx_path   = std::filesystem::path(config.model_path) / "bert.onnx";
+    auto bert_engine_path = std::filesystem::path(config.model_path) / "bert.engine";
+    auto tokenizer_path   = resources_path / "bert_tokenizer.json";
+    // TRT backend 优先找 .engine，再找 .onnx
+    bool use_trt = config.backend == Model::BackendType::kTensorRT;
+    auto bert_path = (use_trt && std::filesystem::exists(bert_engine_path))
+                         ? bert_engine_path
+                         : bert_onnx_path;
     if (std::filesystem::exists(bert_path)) {
-      bert_model->Init<Model::ONNXBackend>(
-          bert_path.string(), tokenizer_path.string(), device_ctx->GetDevice());
+      if (use_trt) {
+        Model::BackendConfig bert_cfg;
+        bert_cfg.device = device_ctx->GetDevice();
+        bert_cfg.engine_cache_dir = config.engine_cache_dir;
+        bert_model->Init<Model::TensorRTBackend>(
+            bert_path.string(), tokenizer_path.string(), bert_cfg);
+      } else {
+        bert_model->Init<Model::ONNXBackend>(
+            bert_onnx_path.string(), tokenizer_path.string(), device_ctx->GetDevice());
+      }
       g2p_pipeline->RegisterLangProcess("zh", std::make_unique<G2P::G2PZH>(),
                                         std::move(bert_model), true);
     }
@@ -207,6 +236,9 @@ public:
       PrintError("[InferencePipeline] Speaker features incomplete");
       return nullptr;
     }
+    PrintDebug("[InferencePipeline] ref_phones={}, ref_bert={}",
+               ref_phones ? fmt::format("[{}]", fmt::join(ref_phones->Shape(), ",")) : "null",
+               ref_bert   ? fmt::format("[{}]", fmt::join(ref_bert->Shape(),   ",")) : "null");
 
     // 获取模型
     auto gpt_encoder = model_pool.GetModel<Model::GPTEncoderModel>(
@@ -264,11 +296,6 @@ public:
       all_bert->Reshape({1, all_bert->Shape()[0], all_bert->Shape()[1]});
     }
 
-    // 确保精度一致
-    if (all_bert->Type() != compute_precision) {
-      all_bert = all_bert->To(all_bert->GetDevice(), compute_precision);
-    }
-
     // 准备 phoneme_ids
     auto phoneme_ids = std::move(all_phones);
     if (phoneme_ids->Shape().size() == 1) {
@@ -283,9 +310,10 @@ public:
     }
 
     PrintDebug("[InferencePipeline] GPT Encoder inputs:");
-    PrintDebug("  phoneme_ids: [{}, {}], bert_feature: [{}, {}, {}]",
+    PrintDebug("  phoneme_ids: [{}, {}], bert_feature: [{}, {}, {}], prompts: [{}, {}]",
                phoneme_ids->Shape()[0], phoneme_ids->Shape()[1],
-               all_bert->Shape()[0], all_bert->Shape()[1], all_bert->Shape()[2]);
+               all_bert->Shape()[0], all_bert->Shape()[1], all_bert->Shape()[2],
+               prompts->Shape()[0], prompts->Shape()[1]);
 
     // ================================================================
     // GPT Encoder
@@ -294,6 +322,21 @@ public:
         gpt_encoder->Encode(phoneme_ids.get(), prompts.get(), all_bert.get());
 
     // 采样第一个 token
+    if (encoder_output.topk_indices && encoder_output.topk_values) {
+      auto idx_cpu = encoder_output.topk_indices->ToCPU();
+      auto val_cpu = encoder_output.topk_values->To(
+          Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
+      std::string idx_str, val_str;
+      int n = std::min((int)idx_cpu->ElementCount(), 5);
+      for (int i = 0; i < n; ++i) {
+        idx_str += std::to_string(idx_cpu->At<int64_t>(i)) + " ";
+        val_str += std::to_string(val_cpu->Data<float>()[i]) + " ";
+      }
+      PrintDebug("[InferencePipeline] Encoder topk_indices dtype={} (first {}): {}",
+                 static_cast<int>(encoder_output.topk_indices->Type()), n, idx_str);
+      PrintDebug("[InferencePipeline] Encoder topk_values  dtype={} (first {}): {}",
+                 static_cast<int>(encoder_output.topk_values->Type()), n, val_str);
+    }
     int64_t first_token = Utils::SampleTopK(encoder_output.topk_values.get(),
                                             encoder_output.topk_indices.get(),
                                             sample_config.temperature);
@@ -335,9 +378,8 @@ public:
     const int64_t eos_token = 1024;
     const int max_steps = 1500;
 
-    if (first_token != eos_token) {
-      generated_tokens.push_back(first_token);
-    }
+    // 始终将第一个 token 加入（即使是 EOS）
+    generated_tokens.push_back(first_token);
 
     // 预分配 idx tensor（可以重用）
     auto idx = Model::Tensor::Empty({1}, Model::DataType::kInt64,
@@ -349,7 +391,12 @@ public:
     // 记录 GPT 生成开始时间（用于计算 tokens/s）
     auto gpt_gen_start = std::chrono::steady_clock::now();
 
-    for (int step = 0; step < max_steps; ++step) {
+    // 如果第一个 token 就是 EOS，跳过循环
+    if (first_token == eos_token) {
+      PrintDebug("[InferencePipeline] First token is EOS, skipping generation loop");
+    }
+
+    for (int step = 0; step < max_steps && first_token != eos_token; ++step) {
       idx->At<int64_t>(0) = step;
 
       bool step_ok = false;
@@ -445,8 +492,9 @@ public:
     }
 
     if (generated_len <= 0) {
-      PrintError("[InferencePipeline] Generated semantic length is non-positive");
-      return AudioTools::FromByte({}, sampling_rate);
+      PrintWarn("[InferencePipeline] Generated semantic length is non-positive (text too short or model output EOS immediately), returning silence");
+      std::vector<float> silence(sampling_rate / 10, 0.0f);  // 0.1秒静音
+      return AudioTools::FromByte(silence, sampling_rate);
     }
 
     // 创建 generated_sem tensor (1, 1, generated_len)
@@ -998,10 +1046,6 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
     if (all_bert->Shape().size() == 2) {
       all_bert =
           all_bert->View({1, all_bert->Shape()[0], all_bert->Shape()[1]});
-    }
-    // 确保精度一致
-    if (all_bert->Type() != impl_->compute_precision) {
-      all_bert = all_bert->To(all_bert->GetDevice(), impl_->compute_precision);
     }
     // 准备 phoneme_ids 和 prompts
     auto phoneme_ids = all_phones->To(Model::Device(Model::DeviceType::kCPU),

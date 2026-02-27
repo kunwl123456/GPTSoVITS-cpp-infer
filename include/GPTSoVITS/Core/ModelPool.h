@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "GPTSoVITS/Core/DeviceContext.h"
+#include "GPTSoVITS/model/backend/backend_config.h"
 #include "GPTSoVITS/model/device.h"
 #include "GPTSoVITS/model/tensor.h"
 
@@ -49,12 +50,19 @@ enum class ModelType {
  * @brief 模型配置
  */
 struct ModelConfig {
-  std::string path;                         // 模型路径
+  std::string path;                          // 模型路径
   Device device = Device(DeviceType::kCPU);  // 运行设备
   int thread_num = 1;                        // 线程数
   DataType precision = DataType::kFloat32;   // 精度
   bool enable_cache = true;                  // 是否缓存模型实例
   bool lazy_load = false;                    // 是否延迟加载
+
+  // 推理后端选择
+  // kAuto: CUDA 设备优先 TRT,然后 ONNX
+  BackendType backend = BackendType::kAuto;
+
+  // TRT 引擎缓存目录（仅 TRT 后端有效，空表示不缓存）
+  std::string engine_cache_dir;
 
   // tokenizer 路径（BERT 需要）
   std::string tokenizer_path;
@@ -213,6 +221,11 @@ public:
    * @brief 获取模型配置
    */
   [[nodiscard]] const ModelConfig* GetConfig(ModelType type) const;
+
+  /**
+   * @brief 更新模型配置
+   */
+  void UpdateConfig(ModelType type, const std::function<void(ModelConfig&)>& fn);
 
 private:
   ModelPool();

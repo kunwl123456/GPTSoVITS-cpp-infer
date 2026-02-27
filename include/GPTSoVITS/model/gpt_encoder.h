@@ -10,6 +10,8 @@
 
 #include "GPTSoVITS/model/base.h"
 #include "GPTSoVITS/model/tensor.h"
+#include "GPTSoVITS/Utils/exception.h"
+#include "GPTSoVITS/model/backend/backend_config.h"
 
 namespace GPTSoVITS::Model {
 
@@ -55,7 +57,9 @@ public:
             const Device& device = DeviceType::kCPU,
             int work_thread_num = 1) {
     m_model = std::make_unique<MODEL_BACKEND>();
-    m_model->Load(model_path, device, work_thread_num);
+    if (!m_model->Load(model_path, device, work_thread_num)) {
+      THROW_ERRORN("Failed to load GPTEncoderModel from: {}", model_path);
+    }
 
     // Parse cache shape from output metadata
     auto output_names = m_model->GetOutputNames();
@@ -65,6 +69,14 @@ public:
         auto dtype = m_model->GetOutputDataType(name);
         // Will be updated after first inference based on actual shape
       }
+    }
+  }
+
+  template <typename MODEL_BACKEND>
+  void Init(const std::string& model_path, const BackendConfig& config) {
+    m_model = std::make_unique<MODEL_BACKEND>();
+    if (!m_model->Load(model_path, config)) {
+      THROW_ERRORN("Failed to load GPTEncoderModel from: {}", model_path);
     }
   }
 

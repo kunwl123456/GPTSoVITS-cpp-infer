@@ -11,6 +11,7 @@
 
 #include "GPTSoVITS/G2P/Base.h"
 #include "GPTSoVITS/Utils/exception.h"
+#include "GPTSoVITS/model/backend/backend_config.h"
 #include "tokenizers_cpp.h"
 
 
@@ -35,9 +36,26 @@ public:
         (std::istreambuf_iterator<char>(file)),
         std::istreambuf_iterator<char>()
     );
-
     m_tokenzer = tokenizers::Tokenizer::FromBlobJSON(content);
     BertModel::Init<MODEL_BACKEND>(model_path, device, work_thread_num);
+  };
+
+  template <typename MODEL_BACKEND>
+  void Init(const std::string& model_path, const std::string& tokenzer_path,
+            const BackendConfig& config) {
+    std::ifstream file(tokenzer_path);
+    if (!file.is_open()) {
+      THROW_ERRORN("加载Tokenizer失败\nBy:{}", tokenzer_path);
+    }
+    std::string content(
+        (std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>()
+    );
+    m_tokenzer = tokenizers::Tokenizer::FromBlobJSON(content);
+    m_model = std::make_unique<MODEL_BACKEND>();
+    if (!m_model->Load(model_path, config)) {
+      THROW_ERRORN("Failed to load CNBertModel from: {}", model_path);
+    }
   };
 
   EncodeResult EncodeText(const std::string& text);

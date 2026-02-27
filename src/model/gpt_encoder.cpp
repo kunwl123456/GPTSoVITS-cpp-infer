@@ -5,6 +5,8 @@
 #include "GPTSoVITS/model/gpt_encoder.h"
 #include "GPTSoVITS/plog.h"
 
+#include <algorithm>
+
 namespace GPTSoVITS::Model {
 
 GPTEncoderOutput GPTEncoderModel::Encode(
@@ -50,13 +52,25 @@ GPTEncoderOutput GPTEncoderModel::Encode(
     bert_feature_ptr = bert_feature;
   }
 
+  std::unique_ptr<Tensor> phoneme_ids_len_tensor;
+  const auto& input_names = m_model->GetInputNames();
+  bool needs_len = std::find(input_names.begin(), input_names.end(),
+                             "phoneme_ids_len") != input_names.end();
+  if (needs_len) {
+    int64_t seq_len = static_cast<int64_t>(phoneme_ids_ptr->Shape().back());
+    phoneme_ids_len_tensor = Tensor::Empty({1}, DataType::kInt64, model_device);
+    phoneme_ids_len_tensor->At<int64_t>(0) = seq_len;
+  }
+
   // Prepare inputs
   std::unordered_map<std::string, Tensor*> inputs = {
       {"phoneme_ids", phoneme_ids_ptr},
-      // {"phoneme_ids_len", phoneme_ids_len_ptr},
       {"prompts", prompts_ptr},
       {"bert_feature", bert_feature_ptr}
   };
+  if (needs_len) {
+    inputs["phoneme_ids_len"] = phoneme_ids_len_tensor.get();
+  }
 
   // Run inference
   std::unordered_map<std::string, std::unique_ptr<Tensor>> outputs;

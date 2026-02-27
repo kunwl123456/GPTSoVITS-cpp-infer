@@ -16,6 +16,7 @@
 #include "AudioTools.h"
 #include "GPTSoVITS/Core/DeviceContext.h"
 #include "GPTSoVITS/Core/ModelPool.h"
+#include "GPTSoVITS/model/backend/backend_config.h"
 #include "GPTSoVITS/SpeakerManager.h"
 #include "GPTSoVITS/model/sample_config.h"
 
@@ -57,6 +58,10 @@ struct PipelineConfig {
   // G2P 配置
   std::string resources_path;
   std::string default_lang = "zh";
+
+  // 推理后端配置
+  Model::BackendType backend = Model::BackendType::kAuto;
+  std::string engine_cache_dir;  // TRT 引擎缓存目录，空表示不缓存
 
   // 日志配置
   bool verbose = true;

@@ -10,6 +10,7 @@
 #include "GPTSoVITS/GPTSoVITSCpp.h"
 #include "GPTSoVITS/model/CNBertModel.h"
 #include "GPTSoVITS/model/backend/onnx_backend.h"
+#include "GPTSoVITS/model/backend/tensorrt_backend.h"
 #include "GPTSoVITS/model/gpt_encoder.h"
 #include "GPTSoVITS/model/gpt_step.h"
 #include "GPTSoVITS/model/sovits.h"
@@ -83,16 +84,27 @@ ModelType StringToModelType(const std::string& str) {
 
 std::string ModelPool::GetModelFileName(ModelType type) {
   switch (type) {
-    case ModelType::kBert: return "bert.onnx";
-    case ModelType::kSSL: return "ssl.onnx";
-    case ModelType::kVQ: return "vq_encoder.onnx";
+    case ModelType::kBert:        return "bert.onnx";
+    case ModelType::kSSL:         return "ssl.onnx";
+    case ModelType::kVQ:          return "vq_encoder.onnx";
     case ModelType::kSpectrogram: return "spectrogram.onnx";
     case ModelType::kSVEmbedding: return "sv_embedding.onnx";
-    case ModelType::kGPTEncoder: return "gpt_encoder.onnx";
-    case ModelType::kGPTStep: return "gpt_step.onnx";
-    case ModelType::kSoVITS: return "sovits.onnx";
+    case ModelType::kGPTEncoder:  return "gpt_encoder.onnx";
+    case ModelType::kGPTStep:     return "gpt_step.onnx";
+    case ModelType::kSoVITS:      return "sovits.onnx";
     default: return "";
   }
+}
+
+// 实际使用的后端类型
+static BackendType ResolveBackend(const ModelConfig& config) {
+  if (config.backend == BackendType::kAuto) {
+#ifdef WITH_TENSORRT
+    if (config.device.type == DeviceType::kCUDA) return BackendType::kTensorRT;
+#endif
+    return BackendType::kONNX;
+  }
+  return config.backend;
 }
 
 // ============ ModelPool 实现 ============
@@ -165,52 +177,90 @@ std::shared_ptr<void> ModelPool::CreateModel(ModelType type) {
   }
 
   const auto& config = config_it->second;
+  BackendType backend = ResolveBackend(config);
 
-  PrintInfo("[ModelPool] Creating model: {} on device {}",
+  BackendConfig backend_cfg;
+  backend_cfg.device           = config.device;
+  backend_cfg.work_thread_num  = config.thread_num;
+  backend_cfg.engine_cache_dir = config.engine_cache_dir;
+  // ModelConfig::precision 是 DataType，转换为 PrecisionMode
+  switch (config.precision) {
+    case DataType::kFloat16: backend_cfg.precision = PrecisionMode::kFP16;  break;
+    case DataType::kFloat32: backend_cfg.precision = PrecisionMode::kFP32;  break;
+    default:                 backend_cfg.precision = PrecisionMode::kAuto;  break;
+  }
+
+  PrintInfo("[ModelPool] Creating model: {} | backend: {} | device: {} | precision: {}",
             ModelTypeToString(type),
-            config.device.type == DeviceType::kCUDA ? "CUDA" : "CPU");
+            backend == BackendType::kTensorRT ? "TensorRT" : "ONNX",
+            config.device.type == DeviceType::kCUDA ? "CUDA" : "CPU",
+            PrecisionModeToString(backend_cfg.precision));
 
   try {
     switch (type) {
       case ModelType::kBert: {
         auto model = std::make_shared<CNBertModel>();
-        auto tokenizer_path = (GetGlobalResourcesPath() / "bert_tokenizer.json").string();
-        model->Init<ONNXBackend>(config.path, tokenizer_path, config.device, config.thread_num);
+        auto tok = (GetGlobalResourcesPath() / "bert_tokenizer.json").string();
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, tok, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, tok, config.device, config.thread_num);
         return model;
       }
       case ModelType::kSSL: {
         auto model = std::make_shared<SSLModel>();
-        model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
         return model;
       }
       case ModelType::kVQ: {
         auto model = std::make_shared<VQModel>();
-        model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
         return model;
       }
       case ModelType::kSpectrogram: {
         auto model = std::make_shared<SpectrogramModel>();
-        model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
         return model;
       }
       case ModelType::kSVEmbedding: {
         auto model = std::make_shared<SVEmbeddingModel>();
-        model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
         return model;
       }
       case ModelType::kGPTEncoder: {
         auto model = std::make_shared<GPTEncoderModel>();
-        model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
         return model;
       }
       case ModelType::kGPTStep: {
         auto model = std::make_shared<GPTStepModel>();
-        model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
         return model;
       }
       case ModelType::kSoVITS: {
         auto model = std::make_shared<SoVITSModel>();
-        model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+        if (backend == BackendType::kTensorRT)
+          model->Init<TensorRTBackend>(config.path, backend_cfg);
+        else
+          model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
         return model;
       }
       default:
@@ -281,6 +331,12 @@ const ModelConfig* ModelPool::GetConfig(ModelType type) const {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = configs_.find(type);
   return it != configs_.end() ? &it->second : nullptr;
+}
+
+void ModelPool::UpdateConfig(ModelType type, const std::function<void(ModelConfig&)>& fn) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = configs_.find(type);
+  if (it != configs_.end()) fn(it->second);
 }
 
 }  // namespace GPTSoVITS::Model

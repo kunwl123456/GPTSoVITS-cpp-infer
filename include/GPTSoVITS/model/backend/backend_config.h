@@ -1,5 +1,5 @@
 //
-// Created by iFlow CLI on 2026/2/20.
+// Created by Huiyicc on 2026/2/26.
 //
 
 #ifndef GPT_SOVITS_CPP_BACKEND_CONFIG_H
@@ -13,14 +13,27 @@
 namespace GPTSoVITS::Model {
 
 /**
+ * @brief 推理后端类型
+ */
+enum class BackendType {
+#ifdef WITH_ONNX
+  kONNX = 1,  // ONNX Runtime
+#endif
+#ifdef WITH_TENSORRT
+  kTensorRT = 2,  // TensorRT
+#endif
+  kAuto = 3,  // 自动选择：CUDA 设备优先 TRT，否则 ONNX
+};
+
+/**
  * @brief 精度模式
  */
 enum class PrecisionMode {
-  kAuto,     // 自动检测（根据模型输入类型）
-  kFP32,     // 强制 FP32
-  kFP16,     // 强制 FP16
-  kMixed,    // 混合精度（输入自动，计算FP16）
-  kINT8      // INT8
+  kAuto,   // 自动检测（根据模型输入类型）
+  kFP32,   // 强制 FP32
+  kFP16,   // 强制 FP16
+  kMixed,  // 混合精度（输入自动，计算FP16）
+  kINT8    // INT8
 };
 
 /**
@@ -38,6 +51,9 @@ struct BackendConfig {
 
   // IO Binding 配置
   bool enable_iobinding = true;
+
+  // TRT 引擎缓存目录（仅 TensorRT 后端使用，空表示不缓存）
+  std::string engine_cache_dir;
 
   // 内存配置
   // TODO: 未实现，预留，未来扩展

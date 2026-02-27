@@ -239,6 +239,7 @@ if (USE_TENSORRT)
   if (ENABLE_CUDA AND CUDNN_PATH)
     target_include_directories(gsv_lib PUBLIC ${CUDNN_PATH}/include)
     target_link_directories(gsv_lib PUBLIC ${CUDNN_PATH}/lib)
+    target_link_directories(gsv_lib PUBLIC ${CUDNN_PATH}/lib/x64)
     list(APPEND BACKEND_LIBS cudnn)
   endif()
 

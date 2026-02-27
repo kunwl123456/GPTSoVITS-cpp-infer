@@ -1,5 +1,5 @@
 //
-// Created by 19254 on 2026/2/8.
+// Created by 19254 on 2026/2/27.
 //
 // 创建说话人
 //
@@ -13,16 +13,17 @@
 #include "GPTSoVITS/InferencePipeline.h"
 
 #ifdef _HOST_WINDOWS_
-#define MODEL_PATH R"(F:\Engcode\AIAssistant\GPT-SoVITS-Devel\GPT-SoVITS_minimal_inference\onnx_export\firefly_v2_proplus_fp16)"
+#define MODEL_PATH \
+  R"(F:\Engcode\AIAssistant\GPT-SoVITS-Devel\GPT-SoVITS_minimal_inference\onnx_export\firefly_v2_proplus_fp16_trt)"
 #else
-#define MODEL_PATH R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
+#define MODEL_PATH \
+  R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
 #endif
 #ifdef _HOST_WINDOWS_
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #else
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
 #endif
-
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
@@ -36,7 +37,9 @@ int main(int argc, char* argv[]) {
 
     // 解析命令行参数
     std::string speaker_name = "firefly";
-    std::string ref_audio_path =FS_PATH(R"(./看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物钟表小子.wav)").string() ;
+    std::string ref_audio_path =
+        FS_PATH(R"(./看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物钟表小子.wav)")
+            .string();
     std::string ref_text = "看，这尊雕像就是匹诺康尼大名鼎鼎的卡通人物钟表小子";
     std::string ref_lang = "zh";
     std::string output_path = "firefly.gsppkg";
@@ -55,23 +58,32 @@ int main(int argc, char* argv[]) {
     std::cout << "  输出路径: " << output_path << std::endl;
 
     // 创建 Pipeline 配置
-    GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Full(MODEL_PATH);
+    GPTSoVITS::PipelineConfig config =
+        GPTSoVITS::PipelineConfig::Full(MODEL_PATH);
     config.device_type = device.type;
     config.device_id = device.device_id;
     config.resources_path = "./res";  // 资源文件路径
     config.verbose = true;
-    config.backend = GPTSoVITS::Model::BackendType::kONNX;
 
     // 创建 Pipeline
     std::cout << "\n[1/3] 初始化 Pipeline..." << std::endl;
     GPTSoVITS::InferencePipeline pipeline(config);
 
+    auto& pool = pipeline.GetModelPool();
+    for (auto type : GPTSoVITS::Model::GetModelTypesInGroup(GPTSoVITS::Model::ModelGroup::kAll)) {
+      auto* cfg = const_cast<GPTSoVITS::Model::ModelConfig*>(pool.GetConfig(type));
+      if (cfg) {
+        cfg->backend = GPTSoVITS::Model::BackendType::kTensorRT;
+        cfg->engine_cache_dir = "./trt_cache";
+      }
+    }
+
     std::cout << pipeline.GetModelInfo() << std::endl;
 
     // 创建说话人
     std::cout << "\n[2/3] 创建说话人..." << std::endl;
-    auto* speaker = pipeline.CreateSpeaker(
-        speaker_name, ref_lang, ref_audio_path, ref_text);
+    auto* speaker = pipeline.CreateSpeaker(speaker_name, ref_lang,
+                                           ref_audio_path, ref_text);
 
     if (!speaker) {
       std::cerr << "错误：创建说话人失败" << std::endl;

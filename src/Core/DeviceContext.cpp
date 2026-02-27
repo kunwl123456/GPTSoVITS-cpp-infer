@@ -70,7 +70,9 @@ DeviceContext::DeviceContext(DeviceContext&&) noexcept = default;
 DeviceContext& DeviceContext::operator=(DeviceContext&&) noexcept = default;
 
 Model::Device DeviceContext::GetDevice() const {
-  return impl_->current_device;
+  Model::Device dev = impl_->current_device;
+  dev.stream = impl_->stream;
+  return dev;
 }
 
 Model::DeviceType DeviceContext::GetDeviceType() const {

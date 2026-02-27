@@ -1,5 +1,5 @@
 //
-// ONNX Edge Inference Example
+// TRT Edge Inference Example
 // 边缘推理：导入说话人数据包，执行推理
 //
 
@@ -25,7 +25,7 @@ auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
 
 #ifdef HOST_WINDOWS
 #define MODEL_PATH \
-  R"(F:\Engcode\AIAssistant\GPT-SoVITS-Devel\GPT-SoVITS_minimal_inference\onnx_export\firefly_v2_proplus_fp16)"
+  R"(F:\Engcode\AIAssistant\GPT-SoVITS-Devel\GPT-SoVITS_minimal_inference\onnx_export\firefly_v2_proplus_fp16_trt)"
 #else
 #define MODEL_PATH \
   R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
@@ -54,11 +54,11 @@ int main(int argc, char* argv[]) {
   );
   std::string text_lang    = argc >= 4 ? argv[3] : "zh";
   std::string speaker_name = argc >= 5 ? argv[4] : "firefly";
-  std::string output_path  = argc >= 6 ? argv[5] : "edge_output.wav";
+  std::string output_path  = argc >= 6 ? argv[5] : "edge_output_trt.wav";
 
   try {
     std::cout << "========================================\n";
-    std::cout << "  ONNX Edge Inference\n";
+    std::cout << "  TRT Edge Inference\n";
     std::cout << "========================================\n";
 
     // ==================== 预热阶段（不计入基准）====================
@@ -66,9 +66,10 @@ int main(int argc, char* argv[]) {
 
     GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Edge(
         MODEL_PATH, device.type, device.device_id);
-    config.resources_path = "./res";
-    config.verbose        = false;
-    config.backend = GPTSoVITS::Model::BackendType::kONNX;
+    config.resources_path    = "./res";
+    config.verbose           = false;
+    config.backend           = GPTSoVITS::Model::BackendType::kTensorRT;
+    config.engine_cache_dir  = "./trt_cache";
 
     GPTSoVITS::InferencePipeline pipeline(config);
 

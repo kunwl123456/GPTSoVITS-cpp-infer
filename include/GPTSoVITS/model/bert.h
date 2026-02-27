@@ -8,6 +8,7 @@
 #include "GPTSoVITS/model/base.h"
 #include "GPTSoVITS/model/tensor.h"
 #include "GPTSoVITS/G2P/Base.h"
+#include "GPTSoVITS/Utils/exception.h"
 
 namespace GPTSoVITS::Bert {
 
@@ -30,7 +31,9 @@ public:
   void Init(const std::string& model_path,
             const Device& device = DeviceType::kCPU, int work_thread_num = 1) {
     m_model = std::make_unique<MODEL_BACKEND>();
-    m_model->Load(model_path, device, work_thread_num);
+    if (!m_model->Load(model_path, device, work_thread_num)) {
+      THROW_ERRORN("Failed to load BertModel from: {}", model_path);
+    }
   }
 
   struct EncodeResult {
