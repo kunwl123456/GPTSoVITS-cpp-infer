@@ -89,6 +89,8 @@ struct TensorRTBackend::Impl {
   std::unordered_map<std::string, void*>   gpu_buffers;
   std::unordered_map<std::string, size_t>  gpu_buffer_sizes;  // 追踪每个buffer的已分配大小
 
+  std::unordered_map<std::string, nvinfer1::Dims> cached_input_shapes;
+
   cudaStream_t own_stream = nullptr;
 
   TensorRTConfig trt_config;
@@ -142,8 +144,8 @@ static std::vector<ProfileDef> GetProfileDefs(const std::string& model_stem) {
   if (model_stem == "gpt_step") {
     return {
       {"samples",  {1,1},                {1,1},                {1,1}},
-      {"k_cache",  {24,1,1000,512},      {24,1,1000,512},      {24,1,1000,512}},
-      {"v_cache",  {24,1,1000,512},      {24,1,1000,512},      {24,1,1000,512}},
+      {"k_cache",  {24,1,1,512},         {24,1,500,512},       {24,1,1000,512}},
+      {"v_cache",  {24,1,1,512},         {24,1,500,512},       {24,1,1000,512}},
       {"x_len",    {1},                  {1},                  {1}},
       {"y_len",    {1},                  {1},                  {1}},
       {"idx",      {1},                  {1},                  {1}},
@@ -219,6 +221,15 @@ bool TensorRTBackend::Load(const std::string& model_path,
   }
 
   cudaSetDevice(impl_->device_id);
+
+  // Create CUDA stream immediately to avoid first-inference latency
+  if (!impl_->own_stream) {
+    cudaError_t err = cudaStreamCreate(&impl_->own_stream);
+    if (err != cudaSuccess) {
+      PrintError("[TRTBackend] cudaStreamCreate failed: {}", cudaGetErrorString(err));
+      return false;
+    }
+  }
 
   // 检测硬件 FP8 支持（Hopper sm_90 / Ada sm_89）
   {
@@ -474,14 +485,36 @@ bool TensorRTBackend::InferCore(
 
   auto* ctx = impl_->context.get();
 
-  // 绑定输入，同时设置动态 shape
+  // 绑定输入，仅在 shape 变化时设置动态 shape
   for (const auto& [name, tensor] : inputs) {
-    // 设置动态 shape
+    // 构建当前 shape
     nvinfer1::Dims dims;
     dims.nbDims = static_cast<int>(tensor->Shape().size());
     for (int i = 0; i < dims.nbDims; ++i)
       dims.d[i] = static_cast<int32_t>(tensor->Shape()[i]);
-    ctx->setInputShape(name.c_str(), dims);
+
+    auto it = impl_->cached_input_shapes.find(name);
+    bool shape_changed = false;
+    if (it == impl_->cached_input_shapes.end()) {
+      shape_changed = true;
+    } else {
+      const auto& cached = it->second;
+      if (cached.nbDims != dims.nbDims) {
+        shape_changed = true;
+      } else {
+        for (int i = 0; i < dims.nbDims; ++i) {
+          if (cached.d[i] != dims.d[i]) {
+            shape_changed = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (shape_changed) {
+      ctx->setInputShape(name.c_str(), dims);
+      impl_->cached_input_shapes[name] = dims;
+    }
 
     void* ptr = tensor->Data();
     // 若输入在 CPU，需先拷贝到 GPU
@@ -498,8 +531,11 @@ bool TensorRTBackend::InferCore(
           THROW_ERRORN("[TRTBackend] cudaMalloc failed for input '{}': {}", name, cudaGetErrorString(err));
         buf_size = bytes;
       }
-      cudaMemcpy(gpu_buf, ptr, bytes, cudaMemcpyHostToDevice);
+      // 使用异步拷贝提升性能
+      cudaMemcpyAsync(gpu_buf, ptr, bytes, cudaMemcpyHostToDevice, impl_->own_stream);
       ptr = gpu_buf;
+    } else {
+      // GPU tensor: 直接使用指针,无需拷贝
     }
     ctx->setTensorAddress(name.c_str(), ptr);
   }
@@ -526,7 +562,6 @@ bool TensorRTBackend::InferCore(
   }
 
   // 执行推理
-  impl_->EnsureStream();
   cudaStream_t stream = impl_->own_stream;
   bool ok = ctx->enqueueV3(stream);
   if (!ok) {
@@ -545,7 +580,11 @@ bool TensorRTBackend::InferCore(
     }
   }
 
-  cudaStreamSynchronize(stream);
+  // 注意: 不在这里同步!
+  // 对于 ForwardWithPreallocatedOutput (IO Binding 路径),
+  // 调用者负责在需要时同步 (例如访问 CPU 输出前)
+  // 这样可以让多个推理调用流水线化,减少同步开销
+
   return true;
 }
 
@@ -563,21 +602,39 @@ void TensorRTBackend::Forward(
     for (const auto& [name, _] : outputs) out_names.push_back(name);
   }
 
-  // 先 setInputShape，才能正确查询动态输出 shape
+  // 为每个输出分配 GPU Tensor
+  // Note: InferCore will handle setInputShape with caching, so we need to call it first
+  // to get the correct output shapes after shape inference
+  std::unordered_map<std::string, Tensor*> out_ptrs;
+  std::unordered_map<std::string, std::unique_ptr<Tensor>> tmp_tensors;
+
+  // Temporarily set input shapes to infer output shapes
+  auto* ctx = impl_->context.get();
   for (const auto& [name, tensor] : inputs) {
     nvinfer1::Dims dims;
     dims.nbDims = static_cast<int>(tensor->Shape().size());
     for (int i = 0; i < dims.nbDims; ++i)
       dims.d[i] = static_cast<int32_t>(tensor->Shape()[i]);
-    impl_->context->setInputShape(name.c_str(), dims);
+
+    auto it = impl_->cached_input_shapes.find(name);
+    bool need_set = (it == impl_->cached_input_shapes.end() ||
+                     it->second.nbDims != dims.nbDims);
+    if (!need_set && it != impl_->cached_input_shapes.end()) {
+      for (int i = 0; i < dims.nbDims; ++i) {
+        if (it->second.d[i] != dims.d[i]) {
+          need_set = true;
+          break;
+        }
+      }
+    }
+    if (need_set) {
+      ctx->setInputShape(name.c_str(), dims);
+      impl_->cached_input_shapes[name] = dims;
+    }
   }
 
-  // 为每个输出分配 GPU Tensor
-  std::unordered_map<std::string, Tensor*> out_ptrs;
-  std::unordered_map<std::string, std::unique_ptr<Tensor>> tmp_tensors;
-
   for (const auto& name : out_names) {
-    nvinfer1::Dims dims = impl_->context->getTensorShape(name.c_str());
+    nvinfer1::Dims dims = ctx->getTensorShape(name.c_str());
     if (dims.nbDims <= 0)
       THROW_ERRORN("[TRTBackend] getTensorShape failed for output '{}' (nbDims={}), "
                    "check that all input shapes were set correctly", name, dims.nbDims);
@@ -597,11 +654,10 @@ void TensorRTBackend::Forward(
     THROW_ERROR("[TRTBackend] Forward failed");
   }
 
-  // 将 GPU tensor 深拷贝到 CPU
+  // 保持 GPU tensor 在 GPU 上，与 ONNX 后端行为一致
+  // 调用者可以根据需要决定是否拷贝到 CPU
   for (const auto& name : out_names) {
-    auto& gpu_t = tmp_tensors[name];
-    auto cpu_t = gpu_t->ToDevice(Device(DeviceType::kCPU));
-    outputs[name] = std::move(cpu_t);
+    outputs[name] = std::move(tmp_tensors[name]);
   }
 }
 
@@ -646,6 +702,16 @@ DataType TensorRTBackend::GetOutputDataType(const std::string& name) const {
   auto it = impl_->output_types.find(name);
   if (it == impl_->output_types.end()) THROW_ERRORN("TRT output not found: {}", name);
   return it->second;
+}
+
+void TensorRTBackend::Synchronize() {
+  if (impl_->own_stream) {
+    cudaStreamSynchronize(impl_->own_stream);
+  }
+}
+
+cudaStream_t TensorRTBackend::GetStream() const {
+  return impl_->own_stream;
 }
 
 // ============ BackendFactory ============

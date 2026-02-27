@@ -5,6 +5,11 @@
 #ifndef GPT_SOVITS_CPP_TENSORRT_BACKEND_H
 #define GPT_SOVITS_CPP_TENSORRT_BACKEND_H
 
+#ifdef WITH_CUDA
+#include <driver_types.h>
+
+
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -83,6 +88,10 @@ public:
   DataType GetInputDataType(const std::string& name) const override;
   DataType GetOutputDataType(const std::string& name) const override;
 
+  void Synchronize();
+
+  cudaStream_t GetStream() const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -108,5 +117,5 @@ public:
 };
 
 }  // namespace GPTSoVITS::Model
-
+#endif
 #endif  // GPT_SOVITS_CPP_TENSORRT_BACKEND_H
