@@ -18,7 +18,8 @@ enum class DataType {
   kInt32,
   kInt64,
   kInt8,
-  kUInt8
+  kUInt8,
+  kUInt64
 };
 
 class Tensor {

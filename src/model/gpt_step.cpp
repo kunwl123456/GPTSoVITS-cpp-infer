@@ -3,10 +3,12 @@
 //
 
 #include "GPTSoVITS/model/gpt_step.h"
+#include "GPTSoVITS/model/gpu_kernels.h"
 #include "GPTSoVITS/plog.h"
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <random>
 #ifdef WITH_CUDA
 #include <cuda_runtime_api.h>
 #endif
@@ -412,6 +414,179 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
 
   return StepWithContext(ctx, ctx->current_samples.get(), step_idx,
                          ctx->x_len_tensor.get(), ctx->y_len_tensor.get());
+}
+
+bool GPTStepModel::StepWithGPUSampling(GPTStepContext* ctx,
+                                       int64_t current_token,
+                                       int step_idx,
+                                       int64_t x_len,
+                                       int64_t y_len,
+                                       float temperature) {
+#ifdef WITH_CUDA
+  if (!ctx || !ctx->enable_gpu_sampling) {
+    PrintError("[GPTStepModel] GPU sampling not enabled or ctx is null");
+    return false;
+  }
+
+  if (step_idx < 0 || step_idx >= ctx->max_steps) {
+    PrintError("[GPTStepModel] step_idx {} out of range [0, {})", step_idx, ctx->max_steps);
+    return false;
+  }
+
+  // Update current_samples (GPU tensor)
+  cudaMemcpyAsync(ctx->current_samples->Data(), &current_token,
+                  sizeof(int64_t), cudaMemcpyHostToDevice, ctx->cuda_stream);
+
+  // Update x_len / y_len tensors (only once)
+  if (!ctx->x_y_len_initialized) {
+    if (ctx->x_len_tensor->Type() == DataType::kInt32) {
+      int32_t xl = static_cast<int32_t>(x_len);
+      int32_t yl = static_cast<int32_t>(y_len);
+      cudaMemcpyAsync(ctx->x_len_tensor->Data(), &xl, sizeof(int32_t), 
+                      cudaMemcpyHostToDevice, ctx->cuda_stream);
+      cudaMemcpyAsync(ctx->y_len_tensor->Data(), &yl, sizeof(int32_t), 
+                      cudaMemcpyHostToDevice, ctx->cuda_stream);
+    } else {
+      cudaMemcpyAsync(ctx->x_len_tensor->Data(), &x_len, sizeof(int64_t), 
+                      cudaMemcpyHostToDevice, ctx->cuda_stream);
+      cudaMemcpyAsync(ctx->y_len_tensor->Data(), &y_len, sizeof(int64_t), 
+                      cudaMemcpyHostToDevice, ctx->cuda_stream);
+    }
+    ctx->x_y_len_initialized = true;
+  }
+
+  // Prepare cache input (with type conversion if needed)
+  std::unique_ptr<Tensor> k_conv, v_conv;
+  Tensor* k_input = ctx->GetCurrentKCache();
+  Tensor* v_input = ctx->GetCurrentVCache();
+
+  if (ctx->needs_cache_conversion) {
+    k_conv = k_input->To(k_input->GetDevice(), m_cache_dtype);
+    v_conv = v_input->To(v_input->GetDevice(), m_cache_dtype);
+    k_input = k_conv.get();
+    v_input = v_conv.get();
+  }
+
+  // Prepare inputs/outputs for inference
+  std::unordered_map<std::string, Tensor*> inputs = {
+      {"samples",  ctx->current_samples.get()},
+      {"k_cache",  k_input},
+      {"v_cache",  v_input},
+      {"idx",      ctx->idx_tensors[step_idx].get()},
+      {"x_len",    ctx->x_len_tensor.get()},
+      {"y_len",    ctx->y_len_tensor.get()}
+  };
+  std::unordered_map<std::string, Tensor*> outputs = {
+      {"topk_values",  ctx->topk_values.get()},
+      {"topk_indices", ctx->topk_indices.get()},
+      {"k_cache_new",  ctx->GetNextKCache()},
+      {"v_cache_new",  ctx->GetNextVCache()}
+  };
+
+  // Run inference
+  bool success = m_model->ForwardWithPreallocatedOutput(inputs, outputs);
+  if (!success) {
+    PrintError("[GPTStepModel] Forward failed");
+    return false;
+  }
+
+  // GPU 采样 (在同一个 stream 上执行)
+  auto topk_val_dtype = ctx->topk_values->Type();
+  cudaError_t err;
+  
+  if (topk_val_dtype == DataType::kFloat16) {
+    err = GPU::LaunchSampleTopKFP16Kernel(
+        ctx->topk_values->Data(),
+        ctx->topk_indices->Data<int64_t>(),
+        ctx->top_k,
+        temperature,
+        ctx->out_token_gpu->Data<int64_t>(),
+        static_cast<uint64_t*>(ctx->rng_state->Data()),
+        ctx->cuda_stream);
+  } else {
+    err = GPU::LaunchSampleTopKKernel(
+        ctx->topk_values->Data(),
+        ctx->topk_indices->Data<int64_t>(),
+        ctx->top_k,
+        temperature,
+        ctx->out_token_gpu->Data<int64_t>(),
+        static_cast<uint64_t*>(ctx->rng_state->Data()),
+        ctx->cuda_stream);
+  }
+
+  if (err != cudaSuccess) {
+    PrintError("[GPTStepModel] GPU sampling kernel failed: {}", cudaGetErrorString(err));
+    return false;
+  }
+
+  ctx->SwapBuffers();
+  return true;
+#else
+  PrintError("[GPTStepModel] GPU sampling requires CUDA support");
+  return false;
+#endif
+}
+
+int64_t GPTStepModel::GetSampledTokenGPU(GPTStepContext* ctx) {
+#ifdef WITH_CUDA
+  if (!ctx || !ctx->enable_gpu_sampling || !ctx->out_token_gpu) {
+    return -1;
+  }
+
+  int64_t token = 0;
+  cudaMemcpyAsync(&token, ctx->out_token_gpu->Data<int64_t>(), 
+                  sizeof(int64_t), cudaMemcpyDeviceToHost, ctx->cuda_stream);
+  cudaStreamSynchronize(ctx->cuda_stream);
+  return token;
+#else
+  return -1;
+#endif
+}
+
+bool GPTStepModel::EnableGPUSampling(GPTStepContext* ctx, uint64_t seed) {
+#ifdef WITH_CUDA
+  if (!ctx) {
+    PrintError("[GPTStepModel] Context is null");
+    return false;
+  }
+
+  Device model_device = m_model->GetDevice();
+  if (model_device.type != DeviceType::kCUDA) {
+    PrintWarn("[GPTStepModel] GPU sampling only available on CUDA device");
+    return false;
+  }
+
+  if (model_device.stream) {
+    ctx->cuda_stream = static_cast<cudaStream_t>(model_device.stream);
+    ctx->owns_stream = false;
+    PrintDebug("[GPTStepModel] Using model's CUDA stream");
+  } else if (!ctx->cuda_stream) {
+    cudaError_t err = cudaStreamCreate(&ctx->cuda_stream);
+    if (err != cudaSuccess) {
+      PrintError("[GPTStepModel] Failed to create CUDA stream: {}", cudaGetErrorString(err));
+      return false;
+    }
+    ctx->owns_stream = true;
+    PrintDebug("[GPTStepModel] Created new CUDA stream");
+  }
+
+  ctx->rng_state = Tensor::Empty({1}, DataType::kUInt64, model_device);
+  uint64_t init_seed = (seed != 0) ? seed : static_cast<uint64_t>(std::random_device{}());
+  cudaMemcpyAsync(ctx->rng_state->Data(), &init_seed, sizeof(uint64_t), 
+                  cudaMemcpyHostToDevice, ctx->cuda_stream);
+
+  ctx->out_token_gpu = Tensor::Empty({1}, DataType::kInt64, model_device);
+
+  ctx->enable_gpu_sampling = true;
+  ctx->top_k = static_cast<int>(ctx->topk_values->Shape().back());
+  
+  PrintInfo("[GPTStepModel] GPU sampling enabled (seed={}, top_k={}, own_stream={})", 
+            init_seed, ctx->top_k, ctx->owns_stream);
+  return true;
+#else
+  PrintWarn("[GPTStepModel] GPU sampling requires CUDA support");
+  return false;
+#endif
 }
 
 }  // namespace GPTSoVITS::Model

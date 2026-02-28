@@ -537,6 +537,12 @@ bool TensorRTBackend::InferCore(
   impl_->EnsureStream();
   cudaStream_t stream = impl_->own_stream;
 
+  if (!device_.stream) {
+    device_.stream = stream;
+  }
+
+  bool has_cpu_io = false;
+
   // 设置所有输入的动态shape
   for (const auto& [name, tensor] : inputs) {
     nvinfer1::Dims dims;
@@ -544,6 +550,7 @@ bool TensorRTBackend::InferCore(
     for (int i = 0; i < dims.nbDims; ++i)
       dims.d[i] = static_cast<int32_t>(tensor->Shape()[i]);
     ctx->setInputShape(name.c_str(), dims);
+    if (tensor->IsCPU()) has_cpu_io = true;
   }
 
   // 异步H2D拷贝
@@ -584,6 +591,7 @@ bool TensorRTBackend::InferCore(
     void* ptr = tensor->Data();
 
     if (tensor->IsCPU()) {
+      has_cpu_io = true;
       // CPU输出需要临时GPU buffer
       const std::string buf_key = name + "_out";
       auto& gpu_buf  = impl_->gpu_buffers[buf_key];
@@ -626,12 +634,13 @@ bool TensorRTBackend::InferCore(
     }
   }
 
-  // 统一同步
-  cudaError_t sync_err = cudaStreamSynchronize(stream);
-  if (sync_err != cudaSuccess) {
-    PrintError("[TRTBackend] cudaStreamSynchronize failed: {}",
-               cudaGetErrorString(sync_err));
-    return false;
+  if (has_cpu_io) {
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    if (sync_err != cudaSuccess) {
+      PrintError("[TRTBackend] cudaStreamSynchronize failed: {}",
+                 cudaGetErrorString(sync_err));
+      return false;
+    }
   }
 
   return true;

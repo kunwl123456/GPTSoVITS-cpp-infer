@@ -14,6 +14,10 @@
 #include "GPTSoVITS/Utils/exception.h"
 #include "GPTSoVITS/model/backend/backend_config.h"
 
+#ifdef WITH_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace GPTSoVITS::Model {
 
 /**
@@ -54,6 +58,34 @@ struct GPTStepContext {
 
   // 是否需要 cache 类型转换 (input dtype != output dtype)
   bool needs_cache_conversion = false;
+
+  // x_len/y_len 是否已初始化（优化：只在第一次拷贝到 GPU）
+  bool x_y_len_initialized = false;
+
+#ifdef WITH_CUDA
+  // GPU RNG state (Philox counter)
+  std::unique_ptr<Tensor> rng_state;       // [1] uint64 on GPU
+  
+  // GPU 采样输出 token
+  std::unique_ptr<Tensor> out_token_gpu;   // [1] int64 on GPU
+  
+  // CUDA stream for async operations
+  cudaStream_t cuda_stream = nullptr;
+  bool owns_stream = false;
+
+  void* pinned_topk_values = nullptr;
+  void* pinned_topk_indices = nullptr;
+  int64_t pinned_topk_k = 0;
+  
+  // CUDA event for synchronization
+  cudaEvent_t sync_event = nullptr;
+#endif
+  
+  // 是否启用 GPU 采样
+  bool enable_gpu_sampling = false;
+  
+  // top_k 值
+  int top_k = 5;
 
   /**
    * @brief 获取当前输入 cache
@@ -240,6 +272,44 @@ public:
                        int step_idx,
                        int64_t x_len,
                        int64_t y_len);
+
+  /**
+   * @brief 带GPU采样的Step (零CPU同步)
+   *
+   * 推理+采样全部在GPU上完成，避免每步D2H/H2D传输。
+   * 需要 ctx->enable_gpu_sampling == true。
+   *
+   * @param ctx           预分配的上下文 (需启用GPU采样)
+   * @param current_token 当前 token 值
+   * @param step_idx      当前步数 (0-based)
+   * @param x_len         Prompt 长度
+   * @param y_len         Target 文本长度
+   * @param temperature   采样温度
+   * @return true 如果成功
+   */
+  bool StepWithGPUSampling(GPTStepContext* ctx,
+                           int64_t current_token,
+                           int step_idx,
+                           int64_t x_len,
+                           int64_t y_len,
+                           float temperature);
+
+  /**
+   * @brief 从GPU获取采样的token (仅当使用GPU采样时)
+   *
+   * @param ctx 预分配的上下文
+   * @return 采样的token值，如果失败返回-1
+   */
+  int64_t GetSampledTokenGPU(GPTStepContext* ctx);
+
+  /**
+   * @brief 启用上下文的GPU采样功能
+   *
+   * @param ctx 预分配的上下文
+   * @param seed RNG种子
+   * @return true 如果成功启用
+   */
+  bool EnableGPUSampling(GPTStepContext* ctx, uint64_t seed = 0);
 
   /**
    * @brief Check if IO binding is supported

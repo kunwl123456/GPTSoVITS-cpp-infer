@@ -47,6 +47,40 @@ cudaError_t LaunchSoftmaxKernel(float* logits,
                                 float temperature,
                                 cudaStream_t stream = 0);
 
+/**
+ * @brief GPU Top-K sampling kernel
+ * 
+ * Performs softmax + multinomial sampling entirely on GPU.
+ * This eliminates D2H/H2D round trips during autoregressive generation.
+ * 
+ * @param topk_values Top-K values [1, K] (FP16 or FP32)
+ * @param topk_indices Top-K indices [1, K] (int64)
+ * @param k Number of top-k candidates
+ * @param temperature Temperature for softmax (default: 1.0)
+ * @param out_token Output sampled token [1] (int64)
+ * @param rng_state Random number generator state (will be updated)
+ * @param stream CUDA stream
+ * @return cudaError_t
+ */
+cudaError_t LaunchSampleTopKKernel(const void* topk_values,
+                                   const int64_t* topk_indices,
+                                   int64_t k,
+                                   float temperature,
+                                   int64_t* out_token,
+                                   uint64_t* rng_state,
+                                   cudaStream_t stream = 0);
+
+/**
+ * @brief GPU Top-K sampling kernel with FP16 input (optimized)
+ */
+cudaError_t LaunchSampleTopKFP16Kernel(const void* topk_values,
+                                       const int64_t* topk_indices,
+                                       int64_t k,
+                                       float temperature,
+                                       int64_t* out_token,
+                                       uint64_t* rng_state,
+                                       cudaStream_t stream = 0);
+
 #else
 
 // Stubs for non-CUDA builds

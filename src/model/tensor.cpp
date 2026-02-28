@@ -505,6 +505,7 @@ size_t Tensor::ElementSize(DataType dtype) {
     case DataType::kInt32:
       return 4;
     case DataType::kInt64:
+    case DataType::kUInt64:
       return 8;
     case DataType::kFloat16:
       return 2;

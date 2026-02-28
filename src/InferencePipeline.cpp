@@ -387,74 +387,130 @@ public:
         top_k
     );
 
+    bool use_gpu_sampling = false;
 #ifdef WITH_CUDA
-    std::unique_ptr<Model::Tensor> topk_values_cpu, topk_indices_cpu;
     if (target_device.type == Model::DeviceType::kCUDA) {
-      void* pv = nullptr; void* pi = nullptr;
-      cudaMallocHost(&pv, top_k * sizeof(float));
-      cudaMallocHost(&pi, top_k * sizeof(int64_t));
-      topk_values_cpu = Model::Tensor::CreateFromHost(
-          pv, {1, top_k}, Model::DataType::kFloat32, [](void* p){ cudaFreeHost(p); });
-      topk_indices_cpu = Model::Tensor::CreateFromHost(
-          pi, {1, top_k}, Model::DataType::kInt64, [](void* p){ cudaFreeHost(p); });
-    } else
-#endif
-    {
-      topk_values_cpu = Model::Tensor::Empty(
-          {1, top_k}, Model::DataType::kFloat32, Model::DeviceType::kCPU);
-      topk_indices_cpu = Model::Tensor::Empty(
-          {1, top_k}, Model::DataType::kInt64, Model::DeviceType::kCPU);
+      use_gpu_sampling = gpt_step->EnableGPUSampling(gpt_ctx.get());
+      if (use_gpu_sampling) {
+        PrintInfo("[InferencePipeline] GPU sampling enabled for GPT generation");
+      }
     }
+#endif
 
-    for (int step = 0; step < max_steps && first_token != eos_token; ++step) {
+    // GPU 采样路径
+    if (use_gpu_sampling) {
+#ifdef WITH_CUDA
+      for (int step = 0; step < max_steps && first_token != eos_token; ++step) {
+        bool step_ok = gpt_step->StepWithGPUSampling(
+            gpt_ctx.get(),
+            current_token,
+            step,
+            x_len_val,
+            y_len_val,
+            sample_config.temperature
+        );
 
-      bool step_ok = gpt_step->StepWithContext(
-          gpt_ctx.get(),
-          current_token,
-          step,
-          x_len_val,
-          y_len_val
-      );
+        if (!step_ok) {
+          consecutive_invalid_count++;
+          if (consecutive_invalid_count >= max_consecutive_invalid) {
+            PrintError("[InferencePipeline] GPT Step failed {} times, stopping",
+                       consecutive_invalid_count);
+            break;
+          }
+          generated_tokens.push_back(current_token);
+          continue;
+        }
 
-      if (!step_ok) {
-        consecutive_invalid_count++;
-        if (consecutive_invalid_count >= max_consecutive_invalid) {
-          PrintError("[InferencePipeline] GPT Step failed {} times, stopping",
-                     consecutive_invalid_count);
+        consecutive_invalid_count = 0;
+
+        // 从 GPU 获取采样的 token
+        int64_t next_token = gpt_step->GetSampledTokenGPU(gpt_ctx.get());
+
+        // Token 有效性检查
+        if (next_token < 0 || next_token > eos_token) {
+          next_token = std::clamp(next_token, (int64_t)0, eos_token);
+        }
+
+        current_token = next_token;
+        generated_tokens.push_back(next_token);
+
+        if (next_token == eos_token) {
+          PrintDebug("[InferencePipeline] EOS at step {}", step);
           break;
         }
-        generated_tokens.push_back(current_token);
-        continue;
       }
-
-      consecutive_invalid_count = 0;
-
+#endif
+    } else {
+      // CPU 采样路径 (原有逻辑，优化了 D2H)
+      std::unique_ptr<Model::Tensor> topk_values_cpu, topk_indices_cpu;
+#ifdef WITH_CUDA
+      if (target_device.type == Model::DeviceType::kCUDA) {
+        void* pv = nullptr; void* pi = nullptr;
+        cudaMallocHost(&pv, top_k * sizeof(float));
+        cudaMallocHost(&pi, top_k * sizeof(int64_t));
+        topk_values_cpu = Model::Tensor::CreateFromHost(
+            pv, {1, top_k}, Model::DataType::kFloat32, [](void* p){ cudaFreeHost(p); });
+        topk_indices_cpu = Model::Tensor::CreateFromHost(
+            pi, {1, top_k}, Model::DataType::kInt64, [](void* p){ cudaFreeHost(p); });
+      } else
+#endif
       {
-        auto tv = gpt_ctx->topk_values->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
-        std::memcpy(topk_values_cpu->Data(), tv->Data(), topk_values_cpu->ByteSize());
-      }
-      {
-        auto ti = gpt_ctx->topk_indices->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
-        std::memcpy(topk_indices_cpu->Data(), ti->Data(), topk_indices_cpu->ByteSize());
+        topk_values_cpu = Model::Tensor::Empty(
+            {1, top_k}, Model::DataType::kFloat32, Model::DeviceType::kCPU);
+        topk_indices_cpu = Model::Tensor::Empty(
+            {1, top_k}, Model::DataType::kInt64, Model::DeviceType::kCPU);
       }
 
-      // 采样下一个 token
-      int64_t next_token = Utils::SampleTopK(topk_values_cpu.get(),
-                                             topk_indices_cpu.get(),
-                                             sample_config.temperature);
+      for (int step = 0; step < max_steps && first_token != eos_token; ++step) {
 
-      // Token 有效性检查
-      if (next_token < 0 || next_token > eos_token) {
-        next_token = std::clamp(next_token, (int64_t)0, eos_token);
-      }
+        bool step_ok = gpt_step->StepWithContext(
+            gpt_ctx.get(),
+            current_token,
+            step,
+            x_len_val,
+            y_len_val
+        );
 
-      // 更新 current_token
-      current_token = next_token;
-      generated_tokens.push_back(next_token);
+        if (!step_ok) {
+          consecutive_invalid_count++;
+          if (consecutive_invalid_count >= max_consecutive_invalid) {
+            PrintError("[InferencePipeline] GPT Step failed {} times, stopping",
+                       consecutive_invalid_count);
+            break;
+          }
+          generated_tokens.push_back(current_token);
+          continue;
+        }
 
-      if (next_token == eos_token) {
-        PrintDebug("[InferencePipeline] EOS at step {}", step);
-        break;
+        consecutive_invalid_count = 0;
+
+        {
+          auto tv = gpt_ctx->topk_values->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
+          std::memcpy(topk_values_cpu->Data(), tv->Data(), topk_values_cpu->ByteSize());
+        }
+        {
+          auto ti = gpt_ctx->topk_indices->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
+          std::memcpy(topk_indices_cpu->Data(), ti->Data(), topk_indices_cpu->ByteSize());
+        }
+
+        // 采样下一个 token
+        int64_t next_token = Utils::SampleTopK(topk_values_cpu.get(),
+                                               topk_indices_cpu.get(),
+                                               sample_config.temperature);
+
+        // Token 有效性检查
+        if (next_token < 0 || next_token > eos_token) {
+          next_token = std::clamp(next_token, (int64_t)0, eos_token);
+        }
+
+        // 更新 current_token
+        current_token = next_token;
+        generated_tokens.push_back(next_token);
+
+        if (next_token == eos_token) {
+          PrintDebug("[InferencePipeline] EOS at step {}", step);
+          break;
+        }
       }
     }
 
@@ -479,7 +535,6 @@ public:
     // ================================================================
     // 构建 generated_sem
     // ================================================================
-    int prompt_len = vq_codes->Shape().size() > 1 ? vq_codes->Shape()[1] : vq_codes->Shape()[0];
     int generated_len = static_cast<int>(generated_tokens.size());
 
     // 移除末尾的 EOS token
