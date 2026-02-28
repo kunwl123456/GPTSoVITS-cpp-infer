@@ -4,14 +4,18 @@
 //
 
 #include <chrono>
+#include <cpptrace/cpptrace.hpp>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 #include "GPTSoVITS/AudioTools.h"
 #include "GPTSoVITS/GPTSoVITS.h"
 #include "GPTSoVITS/InferencePipeline.h"
 #include "GPTSoVITS/model/sample_config.h"
+#include "cpptrace/from_current.hpp"
+#include "cpptrace/from_current_macros.hpp"
 
 #ifdef _WIN32
 #define HOST_WINDOWS
@@ -36,6 +40,7 @@ static void PrintUsage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+
 #ifdef _WIN32
   std::system("chcp 65001");
 #endif
@@ -56,7 +61,8 @@ int main(int argc, char* argv[]) {
   std::string speaker_name = argc >= 5 ? argv[4] : "firefly";
   std::string output_path  = argc >= 6 ? argv[5] : "edge_output.wav";
 
-  try {
+  // try {
+  CPPTRACE_TRY {
     std::cout << "========================================\n";
     std::cout << "  ONNX Edge Inference\n";
     std::cout << "========================================\n";
@@ -74,8 +80,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[Warmup] 导入说话人数据包...\n";
     if (!pipeline.ImportSpeaker(speaker_package, speaker_name)) {
-      std::cerr << "错误：无法导入说话人数据包: " << speaker_package << "\n";
-      return 1;
+      THROW_ERROR("错误：无法导入说话人数据包: {}" , speaker_package);
     }
 
     // 首次推理预热
@@ -105,8 +110,7 @@ int main(int argc, char* argv[]) {
     auto t_end   = std::chrono::steady_clock::now();
 
     if (!audio) {
-      std::cerr << "推理失败\n";
-      return 1;
+      THROW_ERROR("推理失败");
     }
 
     audio->SaveToFile(output_path);
@@ -139,8 +143,10 @@ int main(int argc, char* argv[]) {
     std::cout << "-------------------------------------\n";
     std::cout << "\n音频已保存到: " << output_path << "\n";
 
-  } catch (const std::exception& e) {
+  // } catch (const std::exception& e) {
+  } CPPTRACE_CATCH(const std::exception& e) {
     std::cerr << "错误: " << e.what() << "\n";
+    cpptrace::from_current_exception().print();
     return 1;
   }
   return 0;

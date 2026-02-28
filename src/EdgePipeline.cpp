@@ -264,42 +264,12 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
     }
 
     // 创建第一个 token tensor (CPU)
-    auto current_samples = Model::Tensor::Empty(
-        {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-    current_samples->At<int64_t>(0) = first_token;
+    // (current_samples/idx/x_len/y_len tensors no longer needed)
 
-    // 准备索引 (CPU tensor)
-    auto idx = Model::Tensor::Empty(
-        {1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-    idx->At<int64_t>(0) = 0;
-
-    // 从 encoder_output 获取 x_len 和 y_len
-    auto x_len = std::move(encoder_output.x_len);
-    auto y_len = std::move(encoder_output.y_len);
-
-    // KV Cache + ping-pong 缓冲区
-    auto expected_cache_dtype = m_gpt_step_model->GetCacheDType();
-    auto k_cache = std::move(encoder_output.k_cache);
-    auto v_cache = std::move(encoder_output.v_cache);
-    if (k_cache && k_cache->Type() != expected_cache_dtype) {
-      k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
-    }
-    if (v_cache && v_cache->Type() != expected_cache_dtype) {
-      v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
-    }
-    auto k_cache_out = k_cache->Clone();
-    auto v_cache_out = v_cache->Clone();
-
-    // 预分配 topk 输出缓冲区（dtype 匹配模型输出，留在 CPU 供采样使用）
+    // 创建 GPT Step 上下文
     int top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
-    auto topk_val_dtype = m_gpt_step_model->GetModel()->GetOutputDataType("topk_values");
-    auto topk_idx_dtype = m_gpt_step_model->GetModel()->GetOutputDataType("topk_indices");
-    auto topk_values_buf = Model::Tensor::Empty(
-        {1, top_k}, topk_val_dtype, Model::DeviceType::kCPU);
-    auto topk_indices_buf = Model::Tensor::Empty(
-        {1, top_k}, topk_idx_dtype, Model::DeviceType::kCPU);
-
-    const bool use_iobinding = m_gpt_step_model->SupportsIOBinding();
+    const int max_steps = 1500;
+    auto ctx = m_gpt_step_model->CreateContext(*encoder_output.kv_cache, max_steps, top_k);
 
     // 生成的语义 tokens
     std::vector<int64_t> generated_tokens;
@@ -310,39 +280,16 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
       generated_tokens.push_back(first_token);
     }
 
-    // GPT Step 自回归生成
-    const int max_steps = 1500;
     int consecutive_invalid_count = 0;
     const int max_consecutive_invalid = 10;
 
     auto gpt_gen_start = std::chrono::steady_clock::now();
 
+    int64_t current_token = first_token;
     for (int step = 0; step < max_steps; ++step) {
-      bool step_ok = false;
-      if (use_iobinding) {
-        step_ok = m_gpt_step_model->StepWithIOBinding(
-            current_samples.get(),
-            k_cache.get(), v_cache.get(),
-            k_cache_out.get(), v_cache_out.get(),
-            idx.get(), x_len.get(), y_len.get(),
-            topk_values_buf.get(), topk_indices_buf.get());
-      } else {
-        auto step_output = m_gpt_step_model->Step(
-            current_samples.get(),
-            k_cache.get(), v_cache.get(),
-            idx.get(), x_len.get(), y_len.get());
-        step_ok = step_output.topk_values && step_output.k_cache_new && step_output.v_cache_new;
-        if (step_ok) {
-          std::memcpy(topk_values_buf->Data(),
-                      step_output.topk_values->ToCPU()->Data(),
-                      topk_values_buf->ByteSize());
-          std::memcpy(topk_indices_buf->Data(),
-                      step_output.topk_indices->ToCPU()->Data(),
-                      topk_indices_buf->ByteSize());
-          k_cache_out = std::move(step_output.k_cache_new);
-          v_cache_out = std::move(step_output.v_cache_new);
-        }
-      }
+      bool step_ok = m_gpt_step_model->StepWithContext(
+          ctx.get(), current_token, step,
+          encoder_output.x_len, encoder_output.y_len);
 
       if (!step_ok) {
         consecutive_invalid_count++;
@@ -351,21 +298,15 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
                     consecutive_invalid_count, step);
           break;
         }
-        generated_tokens.push_back(current_samples->At<int64_t>(0));
-        idx->At<int64_t>(0)++;
         continue;
       }
 
       consecutive_invalid_count = 0;
 
-      // 交换 cache 指针（ping-pong）
-      std::swap(k_cache, k_cache_out);
-      std::swap(v_cache, v_cache_out);
-
       // 采样下一个 token
       int64_t next_token = Utils::SampleTopK(
-          topk_values_buf.get(),
-          topk_indices_buf.get(),
+          ctx->topk_values.get(),
+          ctx->topk_indices.get(),
           sample_config.temperature);
 
       // 验证 token 有效性
@@ -381,8 +322,7 @@ std::unique_ptr<AudioTools> EdgePipeline::InferSpeaker(
       }
 
       generated_tokens.push_back(next_token);
-      current_samples->At<int64_t>(0) = next_token;
-      idx->At<int64_t>(0)++;
+      current_token = next_token;
     }
 
     auto gpt_gen_end = std::chrono::steady_clock::now();

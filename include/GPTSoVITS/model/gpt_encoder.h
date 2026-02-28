@@ -10,6 +10,7 @@
 
 #include "GPTSoVITS/model/base.h"
 #include "GPTSoVITS/model/tensor.h"
+#include "GPTSoVITS/model/kv_cache.h"
 #include "GPTSoVITS/Utils/exception.h"
 #include "GPTSoVITS/model/backend/backend_config.h"
 
@@ -19,12 +20,11 @@ namespace GPTSoVITS::Model {
  * @brief GPT Encoder output structure
  */
 struct GPTEncoderOutput {
-  std::unique_ptr<Tensor> topk_values;      // [1, top_k]
-  std::unique_ptr<Tensor> topk_indices;     // [1, top_k]
-  std::unique_ptr<Tensor> k_cache;          // [num_layers, batch, num_heads, seq_len, head_dim]
-  std::unique_ptr<Tensor> v_cache;          // [num_layers, batch, num_heads, seq_len, head_dim]
-  std::unique_ptr<Tensor> x_len;            // [1] - prompt length
-  std::unique_ptr<Tensor> y_len;            // [1] - target text length
+  std::unique_ptr<Tensor> topk_values;       // [1, top_k]
+  std::unique_ptr<Tensor> topk_indices;      // [1, top_k]
+  std::unique_ptr<KVCacheBuffer> kv_cache;   // double-buffered KV cache with semantic metadata
+  int64_t x_len = 0;                         // prompt length (scalar)
+  int64_t y_len = 0;                         // target text length (scalar)
 };
 
 /**
@@ -112,6 +112,8 @@ public:
    * @brief Get max sequence length
    */
   [[nodiscard]] int GetMaxSeqLen() const { return m_max_seq_len; }
+
+  void SetMaxLen(int64_t max_len) { m_max_seq_len = static_cast<int>(max_len); }
 
   /**
    * @brief Get the underlying model

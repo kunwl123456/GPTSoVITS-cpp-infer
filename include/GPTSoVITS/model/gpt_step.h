@@ -10,6 +10,7 @@
 
 #include "GPTSoVITS/model/base.h"
 #include "GPTSoVITS/model/tensor.h"
+#include "GPTSoVITS/model/kv_cache.h"
 #include "GPTSoVITS/Utils/exception.h"
 #include "GPTSoVITS/model/backend/backend_config.h"
 
@@ -40,11 +41,19 @@ struct GPTStepContext {
   // 预分配的索引张量 (避免每次创建)
   std::vector<std::unique_ptr<Tensor>> idx_tensors;  // [max_steps] 个 [1] 张量
 
+  // 预分配的标量输入张量
+  std::unique_ptr<Tensor> current_samples;  // [1, 1] on model device
+  std::unique_ptr<Tensor> x_len_tensor;     // [1] on model device, model dtype
+  std::unique_ptr<Tensor> y_len_tensor;     // [1] on model device, model dtype
+
   // 当前使用的缓冲区索引 (0 或 1)
   int current_buffer = 0;
 
   // 最大生成步数
   int max_steps = 1000;
+
+  // 是否需要 cache 类型转换 (input dtype != output dtype)
+  bool needs_cache_conversion = false;
 
   /**
    * @brief 获取当前输入 cache
@@ -81,7 +90,8 @@ protected:
   std::unique_ptr<BaseModel> m_model;
   int m_top_k = 5;
   bool m_supports_iobinding = false;
-  DataType m_cache_dtype = DataType::kFloat32;
+  DataType m_cache_dtype = DataType::kFloat32;      // model INPUT k_cache dtype
+  DataType m_cache_out_dtype = DataType::kFloat32;  // model OUTPUT k_cache_new dtype
 
 public:
   GPTStepModel() = default;
@@ -103,14 +113,7 @@ public:
       THROW_ERRORN("Failed to load GPTStepModel from: {}", model_path);
     }
 
-    // Detect cache data type
-    auto input_names = m_model->GetInputNames();
-    for (const auto& name : input_names) {
-      if (name == "k_cache" || name == "v_cache") {
-        m_cache_dtype = m_model->GetInputDataType(name);
-      }
-    }
-
+    DetectCacheDTypes();
     m_supports_iobinding = true;
   }
 
@@ -121,14 +124,7 @@ public:
       THROW_ERRORN("Failed to load GPTStepModel from: {}", model_path);
     }
 
-    // Detect cache data type
-    auto input_names = m_model->GetInputNames();
-    for (const auto& name : input_names) {
-      if (name == "k_cache" || name == "v_cache") {
-        m_cache_dtype = m_model->GetInputDataType(name);
-      }
-    }
-
+    DetectCacheDTypes();
     m_supports_iobinding = true;
   }
 
@@ -195,6 +191,21 @@ public:
       int top_k = 5);
 
   /**
+   * @brief Create context from a KVCacheBuffer.
+   *
+   * Derives shape from init_cache.Desc() and copies initial k/v data into
+   * the context, so the pipeline does not need to call CopyFrom manually.
+   *
+   * @param init_cache  Encoder output KV cache (read-only)
+   * @param max_steps   Maximum generation steps
+   * @param top_k       Top-K sampling parameter
+   */
+  std::unique_ptr<GPTStepContext> CreateContext(
+      const KVCacheBuffer& init_cache,
+      int max_steps = 1000,
+      int top_k = 5);
+
+  /**
    * @brief 使用上下文进行推理
    *
    * @param ctx 预分配的上下文
@@ -213,6 +224,24 @@ public:
                        Tensor* y_len);
 
   /**
+   * @brief Scalar overload — no Tensor* plumbing in the pipeline.
+   *
+   * Updates the pre-allocated current_samples / x_len / y_len tensors inside
+   * ctx (including CUDA memcpy when needed) and delegates to the Tensor* overload.
+   *
+   * @param ctx           Pre-allocated context from CreateContext
+   * @param current_token Current token value (scalar)
+   * @param step_idx      Current step index (0-based)
+   * @param x_len         Prompt length (scalar, constant across steps)
+   * @param y_len         Target text length (scalar, constant across steps)
+   */
+  bool StepWithContext(GPTStepContext* ctx,
+                       int64_t current_token,
+                       int step_idx,
+                       int64_t x_len,
+                       int64_t y_len);
+
+  /**
    * @brief Check if IO binding is supported
    */
   [[nodiscard]] bool SupportsIOBinding() const { return m_supports_iobinding; }
@@ -223,9 +252,32 @@ public:
   [[nodiscard]] DataType GetCacheDType() const { return m_cache_dtype; }
 
   /**
+   * @brief Get cache output data type
+   */
+  [[nodiscard]] DataType GetCacheOutDType() const { return m_cache_out_dtype; }
+
+  /**
    * @brief Get the underlying model
    */
   [[nodiscard]] const BaseModel* GetModel() const { return m_model.get(); }
+
+private:
+  void DetectCacheDTypes() {
+    for (const auto& name : m_model->GetInputNames()) {
+      if (name == "k_cache" || name == "v_cache") {
+        m_cache_dtype = m_model->GetInputDataType(name);
+        break;
+      }
+    }
+    // Default output dtype to input dtype; override if model says otherwise
+    m_cache_out_dtype = m_cache_dtype;
+    for (const auto& name : m_model->GetOutputNames()) {
+      if (name == "k_cache_new" || name == "v_cache_new") {
+        m_cache_out_dtype = m_model->GetOutputDataType(name);
+        break;
+      }
+    }
+  }
 };
 
 }  // namespace GPTSoVITS::Model

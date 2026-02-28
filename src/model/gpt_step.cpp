@@ -4,8 +4,12 @@
 
 #include "GPTSoVITS/model/gpt_step.h"
 #include "GPTSoVITS/plog.h"
+#include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#ifdef WITH_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
 namespace GPTSoVITS::Model {
 
@@ -240,12 +244,14 @@ std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
   ctx->max_steps = max_steps;
 
   Device model_device = m_model->GetDevice();
-  DataType cache_dtype = m_cache_dtype;
+  // Use output dtype for cache buffers
+  DataType cache_dtype = m_cache_out_dtype;
 
   // 预分配双缓冲 KV cache
-  PrintInfo("[GPTStepContext] Allocating double-buffered KV cache: shape={}, dtype={}, device={}",
+  PrintInfo("[GPTStepContext] Allocating double-buffered KV cache: shape={}, in_dtype={}, out_dtype={}, device={}",
             fmt::join(kv_cache_shape, "x"),
-            static_cast<int>(cache_dtype),
+            static_cast<int>(m_cache_dtype),
+            static_cast<int>(m_cache_out_dtype),
             model_device.type == DeviceType::kCUDA ? "CUDA" : "CPU");
 
   for (int i = 0; i < 2; ++i) {
@@ -253,9 +259,18 @@ std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
     ctx->v_cache[i] = Tensor::Empty(kv_cache_shape, cache_dtype, model_device);
   }
 
-  // 预分配输出缓冲区
-  ctx->topk_values = Tensor::Empty({1, top_k}, DataType::kFloat32, model_device);
-  ctx->topk_indices = Tensor::Empty({1, top_k}, DataType::kInt64, model_device);
+  // 如果 input dtype != output dtype，需要在每步推理前做类型转换
+  ctx->needs_cache_conversion = (m_cache_dtype != m_cache_out_dtype);
+  if (ctx->needs_cache_conversion) {
+    PrintInfo("[GPTStepContext] Cache dtype mismatch (in={}, out={}), per-step conversion enabled",
+              static_cast<int>(m_cache_dtype), static_cast<int>(m_cache_out_dtype));
+  }
+
+  // 预分配输出缓冲区（dtype 从模型输出元数据获取）
+  auto topk_val_dtype = m_model->GetOutputDataType("topk_values");
+  auto topk_idx_dtype = m_model->GetOutputDataType("topk_indices");
+  ctx->topk_values  = Tensor::Empty({1, top_k}, topk_val_dtype, model_device);
+  ctx->topk_indices = Tensor::Empty({1, top_k}, topk_idx_dtype, model_device);
 
   // 预分配索引张量 (0 到 max_steps-1)
   PrintInfo("[GPTStepContext] Pre-allocating {} index tensors", max_steps);
@@ -275,7 +290,30 @@ std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
     }
   }
 
+  // Pre-allocate scalar input tensors for the scalar StepWithContext overload
+  ctx->current_samples = Tensor::Empty({1, 1}, DataType::kInt64, model_device);
+  ctx->x_len_tensor = Tensor::Empty({1}, m_model->GetInputDataType("x_len"), model_device);
+  ctx->y_len_tensor = Tensor::Empty({1}, m_model->GetInputDataType("y_len"), model_device);
+
   PrintInfo("[GPTStepContext] Context created successfully (zero-alloc ready)");
+  return ctx;
+}
+
+std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
+    const KVCacheBuffer& init_cache,
+    int max_steps,
+    int top_k) {
+
+  const auto& desc = init_cache.Desc();
+
+  auto ctx = CreateContext(desc.raw_shape, max_steps, top_k);
+
+  Device target_device = m_model->GetDevice();
+  ctx->k_cache[0] = const_cast<KVCacheBuffer&>(init_cache).CurrentK()
+                        ->To(target_device, m_cache_out_dtype);
+  ctx->v_cache[0] = const_cast<KVCacheBuffer&>(init_cache).CurrentV()
+                        ->To(target_device, m_cache_out_dtype);
+
   return ctx;
 }
 
@@ -295,10 +333,21 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
     return false;
   }
 
+  std::unique_ptr<Tensor> k_conv, v_conv;
+  Tensor* k_input = ctx->GetCurrentKCache();
+  Tensor* v_input = ctx->GetCurrentVCache();
+
+  if (ctx->needs_cache_conversion) {
+    k_conv = k_input->To(k_input->GetDevice(), m_cache_dtype);
+    v_conv = v_input->To(v_input->GetDevice(), m_cache_dtype);
+    k_input = k_conv.get();
+    v_input = v_conv.get();
+  }
+
   std::unordered_map<std::string, Tensor*> inputs = {
       {"samples",  samples},
-      {"k_cache",  ctx->GetCurrentKCache()},
-      {"v_cache",  ctx->GetCurrentVCache()},
+      {"k_cache",  k_input},
+      {"v_cache",  v_input},
       {"idx",      ctx->idx_tensors[step_idx].get()},
       {"x_len",    x_len},
       {"y_len",    y_len}
@@ -313,6 +362,56 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
   bool success = m_model->ForwardWithPreallocatedOutput(inputs, outputs);
   if (success) ctx->SwapBuffers();
   return success;
+}
+
+bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
+                                   int64_t current_token,
+                                   int step_idx,
+                                   int64_t x_len,
+                                   int64_t y_len) {
+  if (!ctx) {
+    PrintError("[GPTStepModel] Context is null (scalar overload)");
+    return false;
+  }
+
+  // Update current_samples tensor with the new token value
+  if (ctx->current_samples->IsCPU()) {
+    ctx->current_samples->At<int64_t>(0) = current_token;
+  }
+#ifdef WITH_CUDA
+  else {
+    cudaMemcpy(ctx->current_samples->Data(), &current_token,
+               sizeof(int64_t), cudaMemcpyHostToDevice);
+  }
+#endif
+
+  // Update x_len / y_len tensors (constant across steps, but cheap to set)
+  if (ctx->x_len_tensor->IsCPU()) {
+    // dtype may be int32 or int64 — write via int64 then let the tensor handle it
+    if (ctx->x_len_tensor->Type() == DataType::kInt32) {
+      ctx->x_len_tensor->At<int32_t>(0) = static_cast<int32_t>(x_len);
+      ctx->y_len_tensor->At<int32_t>(0) = static_cast<int32_t>(y_len);
+    } else {
+      ctx->x_len_tensor->At<int64_t>(0) = x_len;
+      ctx->y_len_tensor->At<int64_t>(0) = y_len;
+    }
+  }
+#ifdef WITH_CUDA
+  else {
+    if (ctx->x_len_tensor->Type() == DataType::kInt32) {
+      int32_t xl = static_cast<int32_t>(x_len);
+      int32_t yl = static_cast<int32_t>(y_len);
+      cudaMemcpy(ctx->x_len_tensor->Data(), &xl, sizeof(int32_t), cudaMemcpyHostToDevice);
+      cudaMemcpy(ctx->y_len_tensor->Data(), &yl, sizeof(int32_t), cudaMemcpyHostToDevice);
+    } else {
+      cudaMemcpy(ctx->x_len_tensor->Data(), &x_len, sizeof(int64_t), cudaMemcpyHostToDevice);
+      cudaMemcpy(ctx->y_len_tensor->Data(), &y_len, sizeof(int64_t), cudaMemcpyHostToDevice);
+    }
+  }
+#endif
+
+  return StepWithContext(ctx, ctx->current_samples.get(), step_idx,
+                         ctx->x_len_tensor.get(), ctx->y_len_tensor.get());
 }
 
 }  // namespace GPTSoVITS::Model

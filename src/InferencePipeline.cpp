@@ -106,6 +106,9 @@ public:
     auto gpt_encoder = model_pool.GetModel<Model::GPTEncoderModel>(
         Model::ModelType::kGPTEncoder);
     if (gpt_encoder && gpt_encoder->GetModel()) {
+      // 注入 max_len，使 ONNX 动态形状后端能正确填充 KVCacheDesc::max_seq_len
+      gpt_encoder->SetMaxLen(static_cast<int64_t>(max_len));
+
       auto dtype = gpt_encoder->GetModel()->GetInputDataType("bert_feature");
       if (dtype == Model::DataType::kFloat16) {
         compute_precision = Model::DataType::kFloat16;
@@ -348,30 +351,16 @@ public:
     // ================================================================
     // GPT Step 自回归生成
     // ================================================================
-    // D1: current_samples 放在模型设备，避免每步 H2D copy；保留 CPU 镜像用于更新
-    int64_t current_token = first_token;
-    auto current_samples = Model::Tensor::Empty({1, 1}, Model::DataType::kInt64, target_device);
-    if (current_samples->IsCPU()) {
-      current_samples->At<int64_t>(0) = current_token;
-    }
-#ifdef WITH_CUDA
-    else {
-      cudaMemcpy(current_samples->Data(), &current_token, sizeof(int64_t), cudaMemcpyHostToDevice);
-    }
-#endif
-    auto x_len = std::move(encoder_output.x_len);
-    auto y_len = std::move(encoder_output.y_len);
-
-    // B1: 从 KV cache 容量计算实际可用步数，避免越界写入导致 token 数量异常
-    // Python: max_steps = min(1000, kv_max_len - x_len - y_len - 1)
-    const int64_t kv_max_len = encoder_output.k_cache->Shape()[2];
-    const int64_t x_len_val  = x_len->At<int64_t>(0);
-    const int64_t y_len_val  = y_len->At<int64_t>(0);
+    const int64_t kv_max_len  = encoder_output.kv_cache->MaxSeqLen();
+    const int64_t x_len_val   = encoder_output.x_len;
+    const int64_t y_len_val   = encoder_output.y_len;
     const int64_t max_gen_len = kv_max_len - x_len_val - y_len_val - 1;
     const int max_steps = static_cast<int>(
         std::min((int64_t)1000, std::max((int64_t)1, max_gen_len)));
     PrintDebug("[InferencePipeline] KV cache: max={}, base={}+{}={}, max_gen_len={}, max_steps={}",
                kv_max_len, x_len_val, y_len_val, x_len_val + y_len_val, max_gen_len, max_steps);
+
+    int64_t current_token = first_token;
 
     std::vector<int64_t> generated_tokens;
     const int64_t eos_token = 1024;
@@ -390,29 +379,13 @@ public:
       PrintDebug("[InferencePipeline] First token is EOS, skipping generation loop");
     }
 
-    // 双缓冲上下文
+    // 双缓冲上下文 — CreateContext(KVCacheBuffer) 内部处理初始 k/v 拷贝
     int top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
     auto gpt_ctx = gpt_step->CreateContext(
-        encoder_output.k_cache->Shape(),  // KV cache shape
+        *encoder_output.kv_cache,
         max_steps,
         top_k
     );
-
-    auto target_cache_device = gpt_ctx->k_cache[0]->GetDevice();
-    auto k_cache_init = encoder_output.k_cache->To(target_cache_device, gpt_step->GetCacheDType());
-    auto v_cache_init = encoder_output.v_cache->To(target_cache_device, gpt_step->GetCacheDType());
-
-    if (target_cache_device.type == Model::DeviceType::kCUDA) {
-      gpt_ctx->k_cache[0]->CopyFrom(k_cache_init.get());
-      gpt_ctx->v_cache[0]->CopyFrom(v_cache_init.get());
-    } else {
-      std::memcpy(gpt_ctx->k_cache[0]->Data(), k_cache_init->Data(), k_cache_init->ByteSize());
-      std::memcpy(gpt_ctx->v_cache[0]->Data(), v_cache_init->Data(), v_cache_init->ByteSize());
-    }
-
-    auto step_device = gpt_step->GetModel()->GetDevice();
-    auto x_len_step = x_len->To(step_device, gpt_step->GetModel()->GetInputDataType("x_len"));
-    auto y_len_step = y_len->To(step_device, gpt_step->GetModel()->GetInputDataType("y_len"));
 
 #ifdef WITH_CUDA
     std::unique_ptr<Model::Tensor> topk_values_cpu, topk_indices_cpu;
@@ -437,10 +410,10 @@ public:
 
       bool step_ok = gpt_step->StepWithContext(
           gpt_ctx.get(),
-          current_samples.get(),
+          current_token,
           step,
-          x_len_step.get(),
-          y_len_step.get()
+          x_len_val,
+          y_len_val
       );
 
       if (!step_ok) {
@@ -456,8 +429,14 @@ public:
 
       consecutive_invalid_count = 0;
 
-      topk_values_cpu->CopyFrom(gpt_ctx->topk_values.get());
-      topk_indices_cpu->CopyFrom(gpt_ctx->topk_indices.get());
+      {
+        auto tv = gpt_ctx->topk_values->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kFloat32);
+        std::memcpy(topk_values_cpu->Data(), tv->Data(), topk_values_cpu->ByteSize());
+      }
+      {
+        auto ti = gpt_ctx->topk_indices->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
+        std::memcpy(topk_indices_cpu->Data(), ti->Data(), topk_indices_cpu->ByteSize());
+      }
 
       // 采样下一个 token
       int64_t next_token = Utils::SampleTopK(topk_values_cpu.get(),
@@ -469,16 +448,8 @@ public:
         next_token = std::clamp(next_token, (int64_t)0, eos_token);
       }
 
-      // 更新 current_token CPU 镜像，并同步到 GPU tensor
+      // 更新 current_token
       current_token = next_token;
-      if (current_samples->IsCPU()) {
-        current_samples->At<int64_t>(0) = current_token;
-      }
-#ifdef WITH_CUDA
-      else {
-        cudaMemcpy(current_samples->Data(), &current_token, sizeof(int64_t), cudaMemcpyHostToDevice);
-      }
-#endif
       generated_tokens.push_back(next_token);
 
       if (next_token == eos_token) {
@@ -1091,35 +1062,12 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
     int64_t first_token = Utils::SampleTopK(encoder_output.topk_values.get(),
                                             encoder_output.topk_indices.get(),
                                             sample_config.temperature);
-    // 创建第一个 token tensor
-    auto current_samples = Model::Tensor::Empty({1, 1}, Model::DataType::kInt64,
-                                                Model::DeviceType::kCPU);
-    current_samples->At<int64_t>(0) = first_token;
-    auto k_cache = std::move(encoder_output.k_cache);
-    auto v_cache = std::move(encoder_output.v_cache);
-    auto x_len = std::move(encoder_output.x_len);
-    auto y_len = std::move(encoder_output.y_len);
 
-    // KV Cache dtype 对齐 + ping-pong 缓冲区
-    auto s_expected_cache_dtype = gpt_step->GetCacheDType();
-    if (k_cache && k_cache->Type() != s_expected_cache_dtype) {
-      k_cache = k_cache->To(k_cache->GetDevice(), s_expected_cache_dtype);
-    }
-    if (v_cache && v_cache->Type() != s_expected_cache_dtype) {
-      v_cache = v_cache->To(v_cache->GetDevice(), s_expected_cache_dtype);
-    }
-    auto s_k_cache_out = k_cache->Clone();
-    auto s_v_cache_out = v_cache->Clone();
-
+    // 创建 GPT Step 上下文（内部处理 dtype 转换和双缓冲）
+    const int max_steps = 1500;
     int s_top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
-    auto s_topk_val_dtype = gpt_step->GetModel()->GetOutputDataType("topk_values");
-    auto s_topk_idx_dtype = gpt_step->GetModel()->GetOutputDataType("topk_indices");
-    auto s_topk_values_buf = Model::Tensor::Empty(
-        {1, s_top_k}, s_topk_val_dtype, Model::DeviceType::kCPU);
-    auto s_topk_indices_buf = Model::Tensor::Empty(
-        {1, s_top_k}, s_topk_idx_dtype, Model::DeviceType::kCPU);
+    auto s_ctx = gpt_step->CreateContext(*encoder_output.kv_cache, max_steps, s_top_k);
 
-    const bool s_use_iobinding = gpt_step->SupportsIOBinding();
     std::vector<int64_t> generated_tokens;
     std::deque<std::vector<int64_t>> chunk_queue;
     std::vector<int64_t> history_tokens;
@@ -1128,7 +1076,6 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       generated_tokens.push_back(first_token);
     }
     // 边生成边解码
-    const int max_steps = 1500;
     int token_counter = 0;
     int chunk_index = 0;
     std::vector<float> last_fade_out = prev_fade_out;
@@ -1199,37 +1146,13 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       chunk_index++;
     };
     // GPT Step 自回归生成
-    auto s_idx = Model::Tensor::Empty({1}, Model::DataType::kInt64,
-                                      Model::DeviceType::kCPU);
+    int64_t s_current_token = first_token;
     int consecutive_invalid_count = 0;
     const int max_consecutive_invalid = 10;
     for (int step = 0; step < max_steps; ++step) {
-      s_idx->At<int64_t>(0) = step;
-
-      bool step_ok = false;
-      if (s_use_iobinding) {
-        step_ok = gpt_step->StepWithIOBinding(
-            current_samples.get(),
-            k_cache.get(), v_cache.get(),
-            s_k_cache_out.get(), s_v_cache_out.get(),
-            s_idx.get(), x_len.get(), y_len.get(),
-            s_topk_values_buf.get(), s_topk_indices_buf.get());
-      } else {
-        auto step_output =
-            gpt_step->Step(current_samples.get(), k_cache.get(), v_cache.get(),
-                           s_idx.get(), x_len.get(), y_len.get());
-        step_ok = step_output.topk_values &&
-                  step_output.topk_values->ElementCount() > 0 &&
-                  step_output.k_cache_new && step_output.v_cache_new;
-        if (step_ok) {
-          auto topk_values_temp = step_output.topk_values->ToCPU();
-          auto topk_indices_temp = step_output.topk_indices->ToCPU();
-          std::memcpy(s_topk_values_buf->Data(), topk_values_temp->Data(), s_topk_values_buf->ByteSize());
-          std::memcpy(s_topk_indices_buf->Data(), topk_indices_temp->Data(), s_topk_indices_buf->ByteSize());
-          s_k_cache_out = std::move(step_output.k_cache_new);
-          s_v_cache_out = std::move(step_output.v_cache_new);
-        }
-      }
+      bool step_ok = gpt_step->StepWithContext(
+          s_ctx.get(), s_current_token, step,
+          encoder_output.x_len, encoder_output.y_len);
 
       if (!step_ok) {
         consecutive_invalid_count++;
@@ -1240,20 +1163,16 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
               consecutive_invalid_count, step);
           break;
         }
-        generated_tokens.push_back(current_samples->At<int64_t>(0));
+        generated_tokens.push_back(s_current_token);
         token_counter++;
         continue;
       }
 
       consecutive_invalid_count = 0;
 
-      // 交换 cache 指针（ping-pong）
-      std::swap(k_cache, s_k_cache_out);
-      std::swap(v_cache, s_v_cache_out);
-
       // 采样下一个 token
-      int64_t next_token = Utils::SampleTopK(s_topk_values_buf.get(),
-                                             s_topk_indices_buf.get(),
+      int64_t next_token = Utils::SampleTopK(s_ctx->topk_values.get(),
+                                             s_ctx->topk_indices.get(),
                                              sample_config.temperature);
       // 检查 EOS
       if (next_token == eos_token) {
@@ -1261,7 +1180,7 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       }
       generated_tokens.push_back(next_token);
       token_counter++;
-      current_samples->At<int64_t>(0) = next_token;
+      s_current_token = next_token;
 
       // 当token数量达到chunk_length时进行分割
       bool is_split = false;

@@ -6,6 +6,7 @@
 #include "GPTSoVITS/plog.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace GPTSoVITS::Model {
 
@@ -89,35 +90,57 @@ GPTEncoderOutput GPTEncoderModel::Encode(
     PrintError("GPT Encoder: missing 'topk_indices' output");
   }
 
+  std::unique_ptr<Tensor> raw_k, raw_v;
   if (outputs.find("k_cache") != outputs.end()) {
-    output.k_cache = std::move(outputs["k_cache"]);
-    // Update cache metadata
-    auto cache_shape = output.k_cache->Shape();
-    if (cache_shape.size() >= 5) {
-      m_num_layers = cache_shape[0];
-      m_num_heads = cache_shape[2];
-      m_head_dim = cache_shape[4];
-      PrintInfo("GPT Encoder cache detected: num_layers={}, num_heads={}, head_dim={}",
-                m_num_layers, m_num_heads, m_head_dim);
-    }
+    raw_k = std::move(outputs["k_cache"]);
   } else {
     PrintError("GPT Encoder: missing 'k_cache' output");
   }
 
   if (outputs.find("v_cache") != outputs.end()) {
-    output.v_cache = std::move(outputs["v_cache"]);
+    raw_v = std::move(outputs["v_cache"]);
   } else {
     PrintError("GPT Encoder: missing 'v_cache' output");
   }
 
+  if (raw_k && raw_v) {
+    KVCacheDesc desc;
+    const auto& s = raw_k->Shape();
+    desc.dtype     = raw_k->Type();
+    desc.device    = raw_k->GetDevice();
+    desc.raw_shape = s;
+
+    if (s.size() == 5) {
+      // TRT layout: [num_layers, batch, num_heads, max_seq_len, head_dim]
+      // max_seq_len is pre-allocated (e.g. 2000), use it directly
+      desc.num_layers  = s[0];
+      m_num_layers     = static_cast<int>(s[0]);
+      m_num_heads      = static_cast<int>(s[2]);
+      m_head_dim       = static_cast<int>(s[4]);
+      desc.max_seq_len = s[3];
+    } else {
+      // ONNX layout: [num_layers, batch, seq_len, head_dim] (seq_len == actual input len)
+      // Use m_max_seq_len from config.json
+      desc.num_layers  = s[0];
+      m_num_layers     = static_cast<int>(s[0]);
+      desc.max_seq_len = static_cast<int64_t>(m_max_seq_len);
+    }
+
+    PrintInfo("GPT Encoder KVCache: layers={}, max_seq_len={}, raw_shape=[{}]",
+              desc.num_layers, desc.max_seq_len,
+              [&]{ std::string r; for (auto v : s) r += std::to_string(v) + ","; return r; }());
+
+    output.kv_cache = KVCacheBuffer::Create(std::move(raw_k), std::move(raw_v), desc);
+  }
+
   if (outputs.find("x_len") != outputs.end()) {
-    output.x_len = std::move(outputs["x_len"]);
+    output.x_len = outputs["x_len"]->ToCPU()->At<int64_t>(0);
   } else {
     PrintError("GPT Encoder: missing 'x_len' output");
   }
 
   if (outputs.find("y_len") != outputs.end()) {
-    output.y_len = std::move(outputs["y_len"]);
+    output.y_len = outputs["y_len"]->ToCPU()->At<int64_t>(0);
   } else {
     PrintError("GPT Encoder: missing 'y_len' output");
   }

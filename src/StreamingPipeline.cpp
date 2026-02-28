@@ -214,10 +214,10 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     return prev_fade_out;
   }
 
-  if (encoder_output.k_cache && encoder_output.v_cache) {
+  if (encoder_output.kv_cache) {
     PrintDebug("[StreamingPipeline] GPT Encoder cache types: k_cache={}, v_cache={}",
-               static_cast<int>(encoder_output.k_cache->Type()),
-               static_cast<int>(encoder_output.v_cache->Type()));
+               static_cast<int>(encoder_output.kv_cache->CurrentK()->Type()),
+               static_cast<int>(encoder_output.kv_cache->CurrentV()->Type()));
     PrintDebug("[StreamingPipeline] GPT Step expected k_cache type: {}",
                static_cast<int>(gpt_step_model->GetModel()->GetInputDataType("k_cache")));
   }
@@ -234,43 +234,10 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     first_token = std::max<int64_t>(0, std::min<int64_t>(first_token, 1024));
   }
 
-  auto current_samples = Model::Tensor::Empty(
-      {1, 1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-  current_samples->At<int64_t>(0) = first_token;
-
-  auto idx = Model::Tensor::Empty(
-      {1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-  idx->At<int64_t>(0) = 0;
-
-  // 从 encoder_output 获取 x_len 和 y_len
-  auto x_len = std::move(encoder_output.x_len);
-  auto y_len = std::move(encoder_output.y_len);
-
-  auto expected_cache_dtype = gpt_step_model->GetCacheDType();
-
-  auto k_cache = std::move(encoder_output.k_cache);
-  auto v_cache = std::move(encoder_output.v_cache);
-  if (k_cache && k_cache->Type() != expected_cache_dtype) {
-    k_cache = k_cache->To(k_cache->GetDevice(), expected_cache_dtype);
-  }
-  if (v_cache && v_cache->Type() != expected_cache_dtype) {
-    v_cache = v_cache->To(v_cache->GetDevice(), expected_cache_dtype);
-  }
-
-  // 预分配 ping-pong cache 缓冲区
-  auto k_cache_out = k_cache->Clone();
-  auto v_cache_out = v_cache->Clone();
-
-  // 预分配 topk 输出缓冲区
+  // 创建 GPT Step 上下文（内部处理 dtype 转换和双缓冲）
   int top_k = static_cast<int>(encoder_output.topk_values->Shape().back());
-  auto topk_val_dtype = gpt_step_model->GetModel()->GetOutputDataType("topk_values");
-  auto topk_idx_dtype = gpt_step_model->GetModel()->GetOutputDataType("topk_indices");
-  auto topk_values_buf = Model::Tensor::Empty(
-      {1, top_k}, topk_val_dtype, Model::DeviceType::kCPU);
-  auto topk_indices_buf = Model::Tensor::Empty(
-      {1, top_k}, topk_idx_dtype, Model::DeviceType::kCPU);
-
-  const bool use_iobinding = gpt_step_model->SupportsIOBinding();
+  const int max_steps = 1500;
+  auto ctx = gpt_step_model->CreateContext(*encoder_output.kv_cache, max_steps, top_k);
 
   // 生成的语义 tokens 列表
   std::vector<int64_t> generated_tokens;
@@ -283,7 +250,6 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   }
 
   // 边生成边解码
-  const int max_steps = 1500;
   int token_counter = 0;
   int chunk_index = 0;
   std::vector<float> last_fade_out = prev_fade_out;
@@ -373,39 +339,13 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
 
   auto gpt_gen_start = std::chrono::steady_clock::now();
 
+  int64_t current_token = first_token;
+
   for (int step = 0; step < max_steps; ++step) {
     // GPT Step
-    bool step_ok = false;
-    if (use_iobinding) {
-      step_ok = gpt_step_model->StepWithIOBinding(
-          current_samples.get(),
-          k_cache.get(), v_cache.get(),
-          k_cache_out.get(), v_cache_out.get(),
-          idx.get(), x_len.get(), y_len.get(),
-          topk_values_buf.get(), topk_indices_buf.get());
-    } else {
-      auto step_output = gpt_step_model->Step(
-          current_samples.get(), k_cache.get(), v_cache.get(),
-          idx.get(), x_len.get(), y_len.get());
-      step_ok = step_output.topk_values && step_output.k_cache_new && step_output.v_cache_new;
-      if (step_ok) {
-        // 复制输出到预分配缓冲区
-        {
-          auto tv = step_output.topk_values->IsCPU()
-              ? step_output.topk_values.get()
-              : (step_output.topk_values = step_output.topk_values->ToCPU(), step_output.topk_values.get());
-          std::memcpy(topk_values_buf->Data(), tv->Data(), topk_values_buf->ByteSize());
-        }
-        {
-          auto ti = step_output.topk_indices->IsCPU()
-              ? step_output.topk_indices.get()
-              : (step_output.topk_indices = step_output.topk_indices->ToCPU(), step_output.topk_indices.get());
-          std::memcpy(topk_indices_buf->Data(), ti->Data(), topk_indices_buf->ByteSize());
-        }
-        k_cache_out = std::move(step_output.k_cache_new);
-        v_cache_out = std::move(step_output.v_cache_new);
-      }
-    }
+    bool step_ok = gpt_step_model->StepWithContext(
+        ctx.get(), current_token, step,
+        encoder_output.x_len, encoder_output.y_len);
 
     if (!step_ok) {
       consecutive_invalid_count++;
@@ -414,22 +354,17 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
                    consecutive_invalid_count, step);
         break;
       }
-      idx->At<int64_t>(0)++;
       token_counter++;
-      generated_tokens.push_back(current_samples->At<int64_t>(0));
+      generated_tokens.push_back(current_token);
       continue;
     }
 
     consecutive_invalid_count = 0;
 
-    // 交换 cache 指针，下一步 k_cache_out 变成输入
-    std::swap(k_cache, k_cache_out);
-    std::swap(v_cache, v_cache_out);
-
     // 采样下一个 token
     int64_t next_token = Utils::SampleTopK(
-        topk_values_buf.get(),
-        topk_indices_buf.get(),
+        ctx->topk_values.get(),
+        ctx->topk_indices.get(),
         temperature);
 
     if (next_token < 0 || next_token > 1024) {
@@ -445,10 +380,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     generated_tokens.push_back(next_token);
     token_counter++;
 
-    current_samples->At<int64_t>(0) = next_token;
-
-    // 更新索引
-    idx->At<int64_t>(0)++;
+    current_token = next_token;
 
     // mute_matrix
     bool is_split = false;

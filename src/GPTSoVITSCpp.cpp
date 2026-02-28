@@ -396,10 +396,12 @@ std::unique_ptr<AudioTools> GPTSoVITSPipline::InferSpeaker(
     auto current_samples = first_token_tensor->Clone();
 
     decoded_semantic_list.push_back(std::move(first_token_tensor));
-    auto k_cache = std::move(encoder_output.k_cache);
-    auto v_cache = std::move(encoder_output.v_cache);
-    auto x_len = std::move(encoder_output.x_len);
-    auto y_len = std::move(encoder_output.y_len);
+    auto k_cache = encoder_output.kv_cache->CurrentK()->Clone();
+    auto v_cache = encoder_output.kv_cache->CurrentV()->Clone();
+    auto x_len = Model::Tensor::Empty({1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
+    x_len->At<int64_t>(0) = encoder_output.x_len;
+    auto y_len = Model::Tensor::Empty({1}, Model::DataType::kInt64, Model::DeviceType::kCPU);
+    y_len->At<int64_t>(0) = encoder_output.y_len;
 
     int max_steps = 1500;
     int64_t eos_token = 1024;
