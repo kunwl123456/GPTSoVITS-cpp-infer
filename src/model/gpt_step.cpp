@@ -4,6 +4,8 @@
 
 #include "GPTSoVITS/model/gpt_step.h"
 #include "GPTSoVITS/plog.h"
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 namespace GPTSoVITS::Model {
 
@@ -227,6 +229,93 @@ bool GPTStepModel::StepWithIOBinding(Tensor* samples,
 
   // IO Binding 推理
   return m_model->ForwardWithPreallocatedOutput(inputs, outputs);
+}
+
+std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
+    const std::vector<int64_t>& kv_cache_shape,
+    int max_steps,
+    int top_k) {
+
+  auto ctx = std::make_unique<GPTStepContext>();
+  ctx->max_steps = max_steps;
+
+  Device model_device = m_model->GetDevice();
+  DataType cache_dtype = m_cache_dtype;
+
+  // 预分配双缓冲 KV cache
+  PrintInfo("[GPTStepContext] Allocating double-buffered KV cache: shape={}, dtype={}, device={}",
+            fmt::join(kv_cache_shape, "x"),
+            static_cast<int>(cache_dtype),
+            model_device.type == DeviceType::kCUDA ? "CUDA" : "CPU");
+
+  for (int i = 0; i < 2; ++i) {
+    ctx->k_cache[i] = Tensor::Empty(kv_cache_shape, cache_dtype, model_device);
+    ctx->v_cache[i] = Tensor::Empty(kv_cache_shape, cache_dtype, model_device);
+  }
+
+  // 预分配输出缓冲区
+  ctx->topk_values = Tensor::Empty({1, top_k}, DataType::kFloat32, model_device);
+  ctx->topk_indices = Tensor::Empty({1, top_k}, DataType::kInt64, model_device);
+
+  // 预分配索引张量 (0 到 max_steps-1)
+  PrintInfo("[GPTStepContext] Pre-allocating {} index tensors", max_steps);
+  ctx->idx_tensors.reserve(max_steps);
+  for (int i = 0; i < max_steps; ++i) {
+    auto idx_tensor = Tensor::Empty({1}, DataType::kInt64, model_device);
+    int64_t* idx_data = static_cast<int64_t*>(idx_tensor->Data());
+    idx_data[0] = static_cast<int64_t>(i);
+    ctx->idx_tensors.push_back(std::move(idx_tensor));
+  }
+
+  PrintInfo("[GPTStepContext] Context created successfully (zero-alloc ready)");
+  return ctx;
+}
+
+bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
+                                   Tensor* samples,
+                                   int step_idx,
+                                   Tensor* x_len,
+                                   Tensor* y_len) {
+
+  if (!ctx) {
+    PrintError("[GPTStepModel] Context is null");
+    return false;
+  }
+
+  if (step_idx < 0 || step_idx >= ctx->max_steps) {
+    PrintError("[GPTStepModel] step_idx {} out of range [0, {})", step_idx, ctx->max_steps);
+    return false;
+  }
+
+  // 获取当前输入和下一个输出的 cache
+  Tensor* k_cache_in = ctx->GetCurrentKCache();
+  Tensor* v_cache_in = ctx->GetCurrentVCache();
+  Tensor* k_cache_out = ctx->GetNextKCache();
+  Tensor* v_cache_out = ctx->GetNextVCache();
+
+  // 使用预分配的索引张量
+  Tensor* idx = ctx->idx_tensors[step_idx].get();
+
+  // 调用 StepWithIOBinding (零拷贝)
+  bool success = StepWithIOBinding(
+      samples,
+      k_cache_in,
+      v_cache_in,
+      k_cache_out,
+      v_cache_out,
+      idx,
+      x_len,
+      y_len,
+      ctx->topk_values.get(),
+      ctx->topk_indices.get()
+  );
+
+  if (success) {
+    // 自动切换缓冲区 (ping-pong)
+    ctx->SwapBuffers();
+  }
+
+  return success;
 }
 
 }  // namespace GPTSoVITS::Model

@@ -26,6 +26,50 @@ struct GPTStepOutput {
 };
 
 /**
+ * @brief KV Cache 双缓冲上下文
+ */
+struct GPTStepContext {
+  // 双缓冲 KV cache (ping-pong)
+  std::unique_ptr<Tensor> k_cache[2];  // [num_layers, batch, max_seq_len, head_dim]
+  std::unique_ptr<Tensor> v_cache[2];  // [num_layers, batch, max_seq_len, head_dim]
+
+  // 输出缓冲区 (复用)
+  std::unique_ptr<Tensor> topk_values;   // [1, top_k]
+  std::unique_ptr<Tensor> topk_indices;  // [1, top_k]
+
+  // 预分配的索引张量 (避免每次创建)
+  std::vector<std::unique_ptr<Tensor>> idx_tensors;  // [max_steps] 个 [1] 张量
+
+  // 当前使用的缓冲区索引 (0 或 1)
+  int current_buffer = 0;
+
+  // 最大生成步数
+  int max_steps = 1000;
+
+  /**
+   * @brief 获取当前输入 cache
+   */
+  Tensor* GetCurrentKCache() { return k_cache[current_buffer].get(); }
+  Tensor* GetCurrentVCache() { return v_cache[current_buffer].get(); }
+
+  /**
+   * @brief 获取下一个输出 cache
+   */
+  Tensor* GetNextKCache() { return k_cache[1 - current_buffer].get(); }
+  Tensor* GetNextVCache() { return v_cache[1 - current_buffer].get(); }
+
+  /**
+   * @brief 切换缓冲区 (ping-pong)
+   */
+  void SwapBuffers() { current_buffer = 1 - current_buffer; }
+
+  /**
+   * @brief 重置到初始状态
+   */
+  void Reset() { current_buffer = 0; }
+};
+
+/**
  * @brief GPT Step Model
  *
  * GPT Step performs single-step autoregressive generation.
@@ -134,6 +178,39 @@ public:
                          Tensor* y_len,
                          Tensor* topk_values_out,
                          Tensor* topk_indices_out);
+
+  /**
+   * @brief 创建双缓冲上下文
+   *
+   * 预分配所有必要的缓冲区，避免生成循环中的内存分配。
+   *
+   * @param kv_cache_shape KV cache 的形状 [num_layers, batch, max_seq_len, head_dim]
+   * @param max_steps 最大生成步数 (默认 1000)
+   * @param top_k Top-K 采样参数 (默认 5)
+   * @return 预分配的上下文对象
+   */
+  std::unique_ptr<GPTStepContext> CreateContext(
+      const std::vector<int64_t>& kv_cache_shape,
+      int max_steps = 1000,
+      int top_k = 5);
+
+  /**
+   * @brief 使用上下文进行推理
+   *
+   * @param ctx 预分配的上下文
+   * @param samples 当前 token [1, 1]
+   * @param step_idx 当前步数 (0-based)
+   * @param x_len Prompt 长度 [1]
+   * @param y_len Target 长度 [1]
+   * @return true 如果成功
+   *
+   * @note 调用后需要手动调用 ctx->SwapBuffers() 切换缓冲区
+   */
+  bool StepWithContext(GPTStepContext* ctx,
+                       Tensor* samples,
+                       int step_idx,
+                       Tensor* x_len,
+                       Tensor* y_len);
 
   /**
    * @brief Check if IO binding is supported
