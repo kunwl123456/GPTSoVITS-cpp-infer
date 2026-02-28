@@ -90,6 +90,7 @@ struct TensorRTBackend::Impl {
   std::unordered_map<std::string, size_t>  gpu_buffer_sizes;  // 追踪每个buffer的已分配大小
 
   cudaStream_t own_stream = nullptr;
+  cudaMemPool_t mem_pool = nullptr;  // CUDA 内存池
 
   TensorRTConfig trt_config;
   int device_id = 0;
@@ -97,21 +98,81 @@ struct TensorRTBackend::Impl {
   ~Impl() {
     FreeBuffers();
     if (own_stream) { cudaStreamDestroy(own_stream); own_stream = nullptr; }
+    if (mem_pool) { cudaMemPoolDestroy(mem_pool); mem_pool = nullptr; }
   }
 
   void EnsureStream() {
     if (!own_stream) {
       cudaSetDevice(device_id);
       cudaStreamCreate(&own_stream);
+
+      // 异步分配
+      cudaMemPoolProps pool_props = {};
+      pool_props.allocType = cudaMemAllocationTypePinned;
+      pool_props.handleTypes = cudaMemHandleTypeNone;
+      pool_props.location.type = cudaMemLocationTypeDevice;
+      pool_props.location.id = device_id;
+
+      cudaError_t err = cudaMemPoolCreate(&mem_pool, &pool_props);
+      if (err != cudaSuccess) {
+        PrintWarn("[TRTBackend] cudaMemPoolCreate failed: {}, fallback to sync alloc",
+                  cudaGetErrorString(err));
+        mem_pool = nullptr;
+      }
     }
   }
 
   void FreeBuffers() {
-    for (auto& [name, ptr] : gpu_buffers) {
-      if (ptr) { cudaFree(ptr); ptr = nullptr; }
+    if (own_stream) {
+      cudaStreamSynchronize(own_stream);
     }
+
+    for (auto& [name, ptr] : gpu_buffers) {
+      if (ptr) {
+        if (mem_pool) {
+          cudaFreeAsync(ptr, own_stream);
+        } else {
+          cudaFree(ptr);
+        }
+        ptr = nullptr;
+      }
+    }
+
+    if (own_stream) {
+      cudaStreamSynchronize(own_stream);
+    }
+
     gpu_buffers.clear();
     gpu_buffer_sizes.clear();
+  }
+
+  // 异步分配GPU内存
+  void* AllocateGPUAsync(size_t bytes, const std::string& debug_name) {
+    void* ptr = nullptr;
+    cudaError_t err;
+
+    if (mem_pool) {
+      err = cudaMallocAsync(&ptr, bytes, own_stream);
+    } else {
+      err = cudaMalloc(&ptr, bytes);
+    }
+
+    if (err != cudaSuccess) {
+      THROW_ERRORN("[TRTBackend] GPU allocation failed for '{}' ({} bytes): {}",
+                   debug_name, bytes, cudaGetErrorString(err));
+    }
+    return ptr;
+  }
+
+  // 异步释放GPU内存
+  void FreeGPUAsync(void* ptr) {
+    if (!ptr) return;
+
+    if (mem_pool) {
+      cudaFreeAsync(ptr, own_stream);
+    } else {
+      cudaFree(ptr);
+    }
   }
 };
 
@@ -473,79 +534,106 @@ bool TensorRTBackend::InferCore(
     const std::unordered_map<std::string, Tensor*>& outputs) {
 
   auto* ctx = impl_->context.get();
+  impl_->EnsureStream();
+  cudaStream_t stream = impl_->own_stream;
 
-  // 绑定输入，同时设置动态 shape
+  // 设置所有输入的动态shape
   for (const auto& [name, tensor] : inputs) {
-    // 设置动态 shape
     nvinfer1::Dims dims;
     dims.nbDims = static_cast<int>(tensor->Shape().size());
     for (int i = 0; i < dims.nbDims; ++i)
       dims.d[i] = static_cast<int32_t>(tensor->Shape()[i]);
     ctx->setInputShape(name.c_str(), dims);
+  }
 
+  // 异步H2D拷贝
+  for (const auto& [name, tensor] : inputs) {
     void* ptr = tensor->Data();
-    // 若输入在 CPU，需先拷贝到 GPU
+
     if (tensor->IsCPU()) {
+      // CPU输入需要异步拷贝到GPU
       const std::string buf_key = name + "_in";
       auto& gpu_buf  = impl_->gpu_buffers[buf_key];
       auto& buf_size = impl_->gpu_buffer_sizes[buf_key];
       size_t bytes   = tensor->ByteSize();
-      // 仅在 buffer 不存在或不够大时才重新分配
+
+      // 仅在buffer不存在或不够大时才重新分配
       if (!gpu_buf || buf_size < bytes) {
-        if (gpu_buf) cudaFree(gpu_buf);
-        cudaError_t err = cudaMalloc(&gpu_buf, bytes);
-        if (err != cudaSuccess)
-          THROW_ERRORN("[TRTBackend] cudaMalloc failed for input '{}': {}", name, cudaGetErrorString(err));
+        if (gpu_buf) {
+          impl_->FreeGPUAsync(gpu_buf);
+        }
+        gpu_buf = impl_->AllocateGPUAsync(bytes, buf_key);
         buf_size = bytes;
       }
-      cudaMemcpy(gpu_buf, ptr, bytes, cudaMemcpyHostToDevice);
+
+      // 异步H2D拷贝
+      cudaError_t err = cudaMemcpyAsync(gpu_buf, ptr, bytes,
+                                        cudaMemcpyHostToDevice, stream);
+      if (err != cudaSuccess) {
+        THROW_ERRORN("[TRTBackend] cudaMemcpyAsync H2D failed for input '{}': {}",
+                     name, cudaGetErrorString(err));
+      }
       ptr = gpu_buf;
     }
+
     ctx->setTensorAddress(name.c_str(), ptr);
   }
 
   // 绑定输出
   for (const auto& [name, tensor] : outputs) {
     void* ptr = tensor->Data();
+
     if (tensor->IsCPU()) {
-      // 输出预分配在 CPU：先用临时 GPU buffer，推理后拷回
+      // CPU输出需要临时GPU buffer
       const std::string buf_key = name + "_out";
       auto& gpu_buf  = impl_->gpu_buffers[buf_key];
       auto& buf_size = impl_->gpu_buffer_sizes[buf_key];
       size_t bytes   = tensor->ByteSize();
+
       if (!gpu_buf || buf_size < bytes) {
-        if (gpu_buf) cudaFree(gpu_buf);
-        cudaError_t err = cudaMalloc(&gpu_buf, bytes);
-        if (err != cudaSuccess)
-          THROW_ERRORN("[TRTBackend] cudaMalloc failed for output '{}': {}", name, cudaGetErrorString(err));
+        if (gpu_buf) {
+          impl_->FreeGPUAsync(gpu_buf);
+        }
+        gpu_buf = impl_->AllocateGPUAsync(bytes, buf_key);
         buf_size = bytes;
       }
       ptr = gpu_buf;
     }
+
     ctx->setTensorAddress(name.c_str(), ptr);
   }
 
-  // 执行推理
-  impl_->EnsureStream();
-  cudaStream_t stream = impl_->own_stream;
+  // 异步推理
   bool ok = ctx->enqueueV3(stream);
   if (!ok) {
     PrintError("[TRTBackend] enqueueV3 failed");
     return false;
   }
 
-  // 若输出在 CPU，拷回
+  // 异步D2H拷贝输出
   for (const auto& [name, tensor] : outputs) {
     if (tensor->IsCPU()) {
       auto it = impl_->gpu_buffers.find(name + "_out");
       if (it != impl_->gpu_buffers.end() && it->second) {
-        cudaMemcpyAsync(tensor->Data(), it->second, tensor->ByteSize(),
-                        cudaMemcpyDeviceToHost, stream);
+        cudaError_t err = cudaMemcpyAsync(tensor->Data(), it->second,
+                                          tensor->ByteSize(),
+                                          cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) {
+          THROW_ERRORN("[TRTBackend] cudaMemcpyAsync D2H failed for output '{}': {}",
+                       name, cudaGetErrorString(err));
+        }
       }
     }
   }
 
-  cudaStreamSynchronize(stream);
+  // 统一同步
+  cudaError_t sync_err = cudaStreamSynchronize(stream);
+  if (sync_err != cudaSuccess) {
+    PrintError("[TRTBackend] cudaStreamSynchronize failed: {}",
+               cudaGetErrorString(sync_err));
+    return false;
+  }
+
   return true;
 }
 
