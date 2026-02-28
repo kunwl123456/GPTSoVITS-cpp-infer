@@ -261,10 +261,18 @@ std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
   PrintInfo("[GPTStepContext] Pre-allocating {} index tensors", max_steps);
   ctx->idx_tensors.reserve(max_steps);
   for (int i = 0; i < max_steps; ++i) {
-    auto idx_tensor = Tensor::Empty({1}, DataType::kInt64, model_device);
-    int64_t* idx_data = static_cast<int64_t*>(idx_tensor->Data());
+    // 先在 CPU 上创建并填充数据
+    auto idx_tensor_cpu = Tensor::Empty({1}, DataType::kInt64, Device{DeviceType::kCPU, 0});
+    int64_t* idx_data = static_cast<int64_t*>(idx_tensor_cpu->Data());
     idx_data[0] = static_cast<int64_t>(i);
-    ctx->idx_tensors.push_back(std::move(idx_tensor));
+
+    // 如果目标设备是 CUDA，则传输到 GPU
+    if (model_device.type == DeviceType::kCUDA) {
+      auto idx_tensor = idx_tensor_cpu->To(model_device,DataType::kInt64);
+      ctx->idx_tensors.push_back(std::move(idx_tensor));
+    } else {
+      ctx->idx_tensors.push_back(std::move(idx_tensor_cpu));
+    }
   }
 
   PrintInfo("[GPTStepContext] Context created successfully (zero-alloc ready)");
@@ -287,34 +295,23 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
     return false;
   }
 
-  // 获取当前输入和下一个输出的 cache
-  Tensor* k_cache_in = ctx->GetCurrentKCache();
-  Tensor* v_cache_in = ctx->GetCurrentVCache();
-  Tensor* k_cache_out = ctx->GetNextKCache();
-  Tensor* v_cache_out = ctx->GetNextVCache();
+  std::unordered_map<std::string, Tensor*> inputs = {
+      {"samples",  samples},
+      {"k_cache",  ctx->GetCurrentKCache()},
+      {"v_cache",  ctx->GetCurrentVCache()},
+      {"idx",      ctx->idx_tensors[step_idx].get()},
+      {"x_len",    x_len},
+      {"y_len",    y_len}
+  };
+  std::unordered_map<std::string, Tensor*> outputs = {
+      {"topk_values",  ctx->topk_values.get()},
+      {"topk_indices", ctx->topk_indices.get()},
+      {"k_cache_new",  ctx->GetNextKCache()},
+      {"v_cache_new",  ctx->GetNextVCache()}
+  };
 
-  // 使用预分配的索引张量
-  Tensor* idx = ctx->idx_tensors[step_idx].get();
-
-  // 调用 StepWithIOBinding (零拷贝)
-  bool success = StepWithIOBinding(
-      samples,
-      k_cache_in,
-      v_cache_in,
-      k_cache_out,
-      v_cache_out,
-      idx,
-      x_len,
-      y_len,
-      ctx->topk_values.get(),
-      ctx->topk_indices.get()
-  );
-
-  if (success) {
-    // 自动切换缓冲区 (ping-pong)
-    ctx->SwapBuffers();
-  }
-
+  bool success = m_model->ForwardWithPreallocatedOutput(inputs, outputs);
+  if (success) ctx->SwapBuffers();
   return success;
 }
 
