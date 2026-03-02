@@ -146,77 +146,15 @@ bool GPTStepModel::StepWithIOBinding(Tensor* samples,
                                      Tensor* topk_values_out,
                                      Tensor* topk_indices_out) {
 
-  // 确保所有输入在正确的设备上并有正确的类型
-  Device model_device = m_model->GetDevice();
-
-  // 准备输入
-  std::unique_ptr<Tensor> samples_converted;
-  Tensor* samples_ptr = nullptr;
-  if (samples->GetDeviceType() != model_device.type ||
-      samples->Type() != m_model->GetInputDataType("samples")) {
-    samples_converted = samples->To(model_device, m_model->GetInputDataType("samples"));
-    samples_ptr = samples_converted.get();
-  } else {
-    samples_ptr = samples;
-  }
-
-  std::unique_ptr<Tensor> k_cache_converted;
-  Tensor* k_cache_ptr = nullptr;
-  if (k_cache_in->GetDeviceType() != model_device.type ||
-      k_cache_in->Type() != m_model->GetInputDataType("k_cache")) {
-    k_cache_converted = k_cache_in->To(model_device, m_model->GetInputDataType("k_cache"));
-    k_cache_ptr = k_cache_converted.get();
-  } else {
-    k_cache_ptr = k_cache_in;
-  }
-
-  std::unique_ptr<Tensor> v_cache_converted;
-  Tensor* v_cache_ptr = nullptr;
-  if (v_cache_in->GetDeviceType() != model_device.type ||
-      v_cache_in->Type() != m_model->GetInputDataType("v_cache")) {
-    v_cache_converted = v_cache_in->To(model_device, m_model->GetInputDataType("v_cache"));
-    v_cache_ptr = v_cache_converted.get();
-  } else {
-    v_cache_ptr = v_cache_in;
-  }
-
-  std::unique_ptr<Tensor> idx_converted;
-  Tensor* idx_ptr = nullptr;
-  if (idx->GetDeviceType() != model_device.type ||
-      idx->Type() != m_model->GetInputDataType("idx")) {
-    idx_converted = idx->To(model_device, m_model->GetInputDataType("idx"));
-    idx_ptr = idx_converted.get();
-  } else {
-    idx_ptr = idx;
-  }
-
-  std::unique_ptr<Tensor> x_len_converted;
-  Tensor* x_len_ptr = nullptr;
-  if (x_len->GetDeviceType() != model_device.type ||
-      x_len->Type() != m_model->GetInputDataType("x_len")) {
-    x_len_converted = x_len->To(model_device, m_model->GetInputDataType("x_len"));
-    x_len_ptr = x_len_converted.get();
-  } else {
-    x_len_ptr = x_len;
-  }
-
-  std::unique_ptr<Tensor> y_len_converted;
-  Tensor* y_len_ptr = nullptr;
-  if (y_len->GetDeviceType() != model_device.type ||
-      y_len->Type() != m_model->GetInputDataType("y_len")) {
-    y_len_converted = y_len->To(model_device, m_model->GetInputDataType("y_len"));
-    y_len_ptr = y_len_converted.get();
-  } else {
-    y_len_ptr = y_len;
-  }
-
+  // 直接使用输入指针,不做转换检查
+  // InferencePipeline负责确保输入已经在正确的设备和类型上
   std::unordered_map<std::string, Tensor*> inputs = {
-      {"samples", samples_ptr},
-      {"k_cache", k_cache_ptr},
-      {"v_cache", v_cache_ptr},
-      {"idx", idx_ptr},
-      {"x_len", x_len_ptr},
-      {"y_len", y_len_ptr}
+      {"samples", samples},
+      {"k_cache", k_cache_in},
+      {"v_cache", v_cache_in},
+      {"idx", idx},
+      {"x_len", x_len},
+      {"y_len", y_len}
   };
 
   std::unordered_map<std::string, Tensor*> outputs;
@@ -233,8 +171,12 @@ bool GPTStepModel::StepWithIOBinding(Tensor* samples,
     outputs["v_cache_new"] = v_cache_out;
   }
 
-  // IO Binding 推理
-  return m_model->ForwardWithPreallocatedOutput(inputs, outputs);
+  // IO Binding
+  bool success = m_model->ForwardWithPreallocatedOutput(inputs, outputs);
+  if (!success) {
+    PrintError("[GPTStepModel] ForwardWithPreallocatedOutput failed");
+  }
+  return success;
 }
 
 std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(

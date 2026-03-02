@@ -222,7 +222,7 @@ public:
       float noise_scale, float speed, Model::InferStats* stats = nullptr) {
     PrintDebug("[InferencePipeline] Inferring segment: {}", text);
     auto device = device_ctx->GetDevice();
-    
+
     // G2P 处理
     auto target_bert_res = g2p_pipeline->GetPhoneAndBert(text, lang);
     if (!target_bert_res || !target_bert_res->PhoneSeq ||
@@ -230,7 +230,7 @@ public:
       PrintError("[InferencePipeline] G2P processing failed");
       return nullptr;
     }
-    
+
     // 获取模型
     auto gpt_encoder = model_pool.GetModel<Model::GPTEncoderModel>(
         Model::ModelType::kGPTEncoder);
@@ -561,7 +561,7 @@ public:
                                               Model::DeviceType::kCPU);
     std::memcpy(generated_sem->Data<int64_t>(), generated_tokens.data(),
                 generated_len * sizeof(int64_t));
-    
+
     // ================================================================
     // SoVITS 解码
     // ================================================================
@@ -570,10 +570,10 @@ public:
     auto text_dtype = sovits->GetModel()->GetInputDataType("text_seq");
     auto spec_dtype = sovits->GetModel()->GetInputDataType("refer_spec");
     auto sv_dtype = sovits->GetModel()->GetInputDataType("sv_emb");
-    
+
     // 直接构建正确形状的输入，避免 reshape
     auto pred_semantic_final = generated_sem->To(sovits_device, pred_dtype);
-    
+
     // text_seq: 直接从 PhoneSeq 构建 (1, seq_len)
     auto text_seq = target_bert_res->PhoneSeq->To(
         Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
@@ -581,17 +581,17 @@ public:
       text_seq->Reshape({1, text_seq->Shape()[0]});
     }
     auto text_seq_final = text_seq->To(sovits_device, text_dtype);
-    
+
     // refer_spec: 确保 3D
     Model::Tensor* refer_spec_ptr = refer_spec;
     std::unique_ptr<Model::Tensor> refer_spec_reshaped;
     if (refer_spec->Shape().size() == 2) {
-      refer_spec_reshaped = refer_spec->View({1, refer_spec->Shape()[0], 
+      refer_spec_reshaped = refer_spec->View({1, refer_spec->Shape()[0],
                                               refer_spec->Shape()[1]});
       refer_spec_ptr = refer_spec_reshaped.get();
     }
     auto refer_spec_final = refer_spec_ptr->To(sovits_device, spec_dtype);
-    
+
     // sv_emb: 确保 2D
     Model::Tensor* sv_emb_ptr = sv_emb;
     std::unique_ptr<Model::Tensor> sv_emb_reshaped;
@@ -600,7 +600,7 @@ public:
       sv_emb_ptr = sv_emb_reshaped.get();
     }
     auto sv_emb_final = sv_emb_ptr->To(sovits_device, sv_dtype);
-    
+
     // SoVITS 推理
     auto t_sovits_start = std::chrono::steady_clock::now();
     auto audio_tensor = sovits->GenerateTensor(
@@ -610,12 +610,12 @@ public:
       stats->sovits_time_s += std::chrono::duration<double>(
           std::chrono::steady_clock::now() - t_sovits_start).count();
     }
-    
+
     if (!audio_tensor) {
       PrintError("[InferencePipeline] SoVITS generation failed");
       return nullptr;
     }
-    
+
     // ================================================================
     // 音频后处理
     // ================================================================
@@ -625,23 +625,23 @@ public:
       PrintError("[InferencePipeline] Failed to convert audio to CPU");
       return AudioTools::FromByte({}, sampling_rate);
     }
-    
+
     size_t audio_size = audio_cpu->ElementCount();
     const float* audio_ptr = audio_cpu->Data<float>();
-    
+
     // 直接从指针构造 vector
     std::vector<float> audio_data(audio_ptr, audio_ptr + audio_size);
-    
+
     // DC offset 去除 - 与 Python 一致
     // Python: audio_np = audio_np - np.mean(audio_np)
     float mean = 0.0f;
     for (const auto& s : audio_data) mean += s;
     mean /= static_cast<float>(audio_size);
     for (auto& s : audio_data) s -= mean;
-    
+
     PrintDebug("[InferencePipeline] Audio: {} samples, DC offset: {:.6f}",
                audio_size, mean);
-    
+
     return AudioTools::FromByte(audio_data, sampling_rate);
   }
 };
@@ -727,7 +727,7 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
     return nullptr;
   }
   std::string use_lang = lang.empty() ? impl_->config.default_lang : lang;
-  
+
   // 文本分句
   Text::Sentence sentence(Text::Sentence::SentenceSplitMethod::Punctuation);
   std::vector<std::string> segments;
@@ -738,12 +738,12 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
 
   sentence.Append(text);
   sentence.Flush();
-  
+
   if (segments.empty()) {
     PrintWarn("[InferencePipeline] No text segments to process");
     return nullptr;
   }
-  
+
   // len(current) + len(s) < 20 则合并
   std::vector<std::string> merged_segments;
   std::string current;
@@ -761,18 +761,18 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
     merged_segments.push_back(current);
   }
   segments = std::move(merged_segments);
-  
+
   PrintInfo("[InferencePipeline] Processing {} segments", segments.size());
-  
+
   // 预加载说话人特征到设备（使用模型检测的精度）
   speaker->EnsureOnDevice(impl_->device_ctx->GetDevice(), impl_->compute_precision);
-  
+
   // 处理每个段落
   std::vector<float> final_audio;
   for (size_t i = 0; i < segments.size(); ++i) {
-    PrintDebug("[InferencePipeline] Processing segment {}/{}: {}", 
+    PrintDebug("[InferencePipeline] Processing segment {}/{}: {}",
                i + 1, segments.size(), segments[i]);
-    
+
     auto audio = impl_->InferSegment(*speaker, segments[i], use_lang,
                                      sample_config, noise_scale, speed, stats);
     if (i == 0 && on_first_segment) {
@@ -783,7 +783,7 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
 
       // 每个 segment 进行 DC offset 去除
       final_audio.insert(final_audio.end(), samples.begin(), samples.end());
-      
+
       // 添加段落间停顿
       if (i < segments.size() - 1) {
         int pause_samples = static_cast<int>(impl_->sampling_rate * 0.3f);
@@ -791,7 +791,7 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
       }
     }
   }
-  
+
   // ================================================================
   // RMS + Peak 组合归一化
   // 先进行 RMS 归一化到目标响度，再进行峰值限制防止削波
@@ -803,21 +803,21 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
     loudness_config.min_gain = 0.1f;         // 最小增益
     loudness_config.enable_peak_limiting = true;
     loudness_config.peak_threshold = 0.9f;   // 峰值限制阈值
-    
+
     LoudnessNormalizer normalizer(loudness_config);
-    
+
     float gain = normalizer.NormalizeCombined(final_audio);
     float rms = normalizer.CalculateRMS(final_audio);
     float peak = normalizer.CalculatePeak(final_audio);
-    
+
     PrintDebug("[InferencePipeline] Applied RMS normalization, gain: {:.4f}, "
                "final RMS: {:.4f}, peak: {:.4f}", gain, rms, peak);
   }
-  
-  PrintInfo("[InferencePipeline] Generated audio: {} samples ({:.2f}s)", 
-            final_audio.size(), 
+
+  PrintInfo("[InferencePipeline] Generated audio: {} samples ({:.2f}s)",
+            final_audio.size(),
             static_cast<float>(final_audio.size()) / impl_->sampling_rate);
-  
+
   return AudioTools::FromByte(final_audio, impl_->sampling_rate);
 }
 std::unique_ptr<AudioTools> InferencePipeline::Infer(
@@ -1011,7 +1011,7 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       "[InferencePipeline::InferStreaming] Starting streaming inference for "
       "speaker: {}, segments: {}",
       speaker_name, segments.size());
-  
+
   // 创建流式响度归一化器
   LoudnessConfig loudness_config;
   loudness_config.target_rms = 0.18f;
@@ -1019,7 +1019,7 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
   loudness_config.enable_peak_limiting = true;
   loudness_config.peak_threshold = 0.9f;
   LoudnessNormalizer loudness_normalizer(loudness_config);
-  
+
   // 预加载说话人特征到设备（使用模型检测的精度）
   auto device = impl_->device_ctx->GetDevice();
   speaker->EnsureOnDevice(device, impl_->compute_precision);
@@ -1037,7 +1037,7 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
   // 获取模型期望的数据类型
   auto phone_dtype = gpt_encoder->GetModel()->GetInputDataType("phoneme_ids");
   auto bert_dtype = gpt_encoder->GetModel()->GetInputDataType("bert_feature");
-  
+
   // 流推理配置
   StreamingConfigInternal stream_config;
   // 获取说话人特征（使用模型期望的数据类型）
@@ -1203,10 +1203,10 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
       chunk.segment_index = segment_index;
       chunk.chunk_index = chunk_index;
       chunk.duration = static_cast<float>(audio_data.size()) / sampling_rate;
-      
+
       // 应用流式响度归一化
       loudness_normalizer.NormalizeStreaming(chunk.audio_data);
-      
+
       callback(chunk);
       chunk_index++;
     };
