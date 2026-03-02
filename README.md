@@ -39,14 +39,23 @@ Goals: **Faster 🏎️**, **Embeddable 🔩**, **Bindable to Everything 🌍**,
 
 *Test text: multilingual ZH/JA/EN mixed, ~19s audio output*
 
-| Metric                        | Python ONNX  | **C++ Edge**     | Python ONNX Stream | **C++ Streaming** |
-|:------------------------------|:-------------|:-----------------|:-------------------|:------------------|
-| **Inference Speed (↑)**       | 172.4 tok/s  | **215.1 tok/s**  | 167.5 tok/s        | **198.6 tok/s**   |
-| **RTF (↓)**                   | 0.3325       | **0.2398**       | 0.3100             | 0.4894            |
-| **First Packet Latency (↓)**  | 2.683 s      | **1.210 s**      | **1.000 s**        | 1.250 s           |
-| **VRAM Usage**                | 3.9 G        | 3.6 G            | 4.5 G              | 4.0 G             |
+**ONNX:**
 
-> C++ Edge vs Python ONNX: **+24.8% throughput**, **-27.9% RTF**, **-54.9% first-packet latency**.
+| Metric                       | Python ONNX | **C++ ONNX**    | Python ONNX Stream | **C++ ONNX Stream** |
+|:-----------------------------|:------------|:----------------|:-------------------|:--------------------|
+| **Inference Speed (↑)**      | 172.4 tok/s | **215.1 tok/s** | 167.5 tok/s        | **222.73 tok/s**    |
+| **RTF (↓)**                  | 0.3325      | **0.2398**      | 0.3100             | 0.4894              |
+| **First Packet Latency (↓)** | 2.683 s     | **1.210 s**     | **1.000 s**        | 1.250 s             |
+| **VRAM Usage (↓)**           | 3.9 G       | **3.6 G**       | 4.5 G              | **4.0** G           |
+
+**TRT:**
+
+| Metric                       | Python TRT  | **C++ TRT**  | **C++ TRT Stream** |
+|:-----------------------------|:------------|:-------------|:-------------------|
+| **Inference Speed (↑)**      | 291.6 tok/s | 312.18 tok/s | **355.65 tok/s**   |
+| **RTF (↓)**                  | 0.2096      | 0.1378       | **0.1205**         |
+| **First Packet Latency (↓)** | 2.683 s     | 0.5 s        | **0.46 S**         |
+| **VRAM Usage (↓)**           | 3.4 G       | 2.8 G        | **2.3 G**          | 
 
 ---
 
