@@ -104,21 +104,31 @@ SoVITSModel      → Neural vocoder → PCM audio
 ### Build
 
 ```bash
-# CPU build
+# CPU build (ONNX only)
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
-# CUDA build (recommended)
+# CUDA build with ONNX
 cmake -B build -S . \
-  -DENABLE_STATIC_RUNTIME=1 \
-  -DONNXRUNTIME_PATH=/path/to/onnxruntime \
   -DENABLE_CUDA=1 \
-  -DCUDNN_PATH=/path/to/cudnn \
-  -DCUDA_TOOLKIT_ROOT_DIR=/path/to/cuda
+  -DONNXRUNTIME_PATH=/path/to/onnxruntime \
+  -DCUDA_TOOLKIT_ROOT_DIR=/path/to/cuda \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+
+# TensorRT build
+cmake -B build -S . \
+  -DUSE_TENSORRT=1 \
+  -DENABLE_CUDA=1 \
+  -DTENSORRT_PATH=/path/to/tensorrt \
+  -DCUDA_TOOLKIT_ROOT_DIR=/path/to/cuda \
+  -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
 ### Step 1 — Export Model (Python side)
+
+**For ONNX:**
 
 ```bash
 # In GPT-SoVITS_minimal_inference repo
@@ -127,38 +137,100 @@ python export_onnx.py \
     --sovits_path "pretrained_models/SoVITS_weights_v2ProPlus/your_model.pth" \
     --cnhubert_base_path pretrained_models/chinese-hubert-base \
     --bert_path pretrained_models/chinese-roberta-wwm-ext-large \
-    --output_dir "onnx_export/my_model_fp16" \
+    --output_dir "onnx_export/my_onnx_model" \
     --max_len 1000 \
     --validate \
     --validation_device cuda
+
+# optimize
+python onnx_to_fp16.py \
+    --input_dir "onnx_export/my_onnx_model"
+    --output_dir "onnx_export/my_onnx_model_fp16"
 ```
+
+**For TensorRT:**
+
+```bash
+python onnx2trt.py \
+    --input_dir onnx_export/my_onnx_model \
+    --output_dir onnx_export/my_trt_model \
+    --shape_profile fitted \
+    --precision auto
+```
+
+**Shape Profile Notes:**
+- C++ SDK uses **fitted** profile by default (optimized for 3-8s audio, ~10s max per segment)
+- Suitable for ≤24GB VRAM with sentence-based inference
+- For longer audio or larger VRAM, modify `GetProfileDefs()` in `src/model/backend/tensorrt_backend.cpp`
 
 ### Step 2 — Create Speaker Package
 
+**ONNX:**
+
 ```bash
-./build/gpt_sovits_cpp_cloud_create_onnx \
-    --ref-audio ref.wav \
-    --ref-text "参考文本" \
-    --lang zh \
-    --speaker-name my_speaker \
-    --output my_speaker.gsppkg
+./build/example/gpt_sovits_cpp_cloud_create_onnx \
+    my_speaker \
+    ref.wav \
+    "参考文本" \
+    zh \
+    my_speaker.gsppkg
+```
+
+**TensorRT:**
+
+```bash
+./build/example/gpt_sovits_cpp_cloud_create_trt \
+    my_speaker \
+    ref.wav \
+    "参考文本" \
+    zh \
+    my_speaker.gsppkg
 ```
 
 ### Step 3 — Run Inference
 
-```bash
-# Distributed (edge) inference
-./build/gpt_sovits_cpp_edge_inference_onnx \
-    --speaker-package my_speaker.gsppkg \
-    --text "要合成的文本" \
-    --output output.wav
+**ONNX Edge Inference:**
 
-# Streaming inference
-./build/gpt_sovits_cpp_streaming_onnx \
+```bash
+./build/example/gpt_sovits_cpp_edge_inference_onnx \
+    my_speaker.gsppkg \
+    "要合成的文本" \
+    zh \
+    my_speaker \
+    output.wav
+```
+
+**ONNX Streaming Inference:**
+
+```bash
+./build/example/gpt_sovits_cpp_streaming_onnx \
     --speaker-package my_speaker.gsppkg \
     --text "要合成的文本" \
+    --lang zh \
     --chunk-length 24 \
     --output output.wav
+```
+
+**TensorRT Edge Inference:**
+
+```bash
+./build/example/gpt_sovits_cpp_edge_inference_trt \
+    my_speaker.gsppkg \
+    "要合成的文本" \
+    zh \
+    my_speaker \
+    output_trt.wav
+```
+
+**TensorRT Streaming Inference:**
+
+```bash
+./build/example/gpt_sovits_cpp_streaming_trt \
+    --speaker-package my_speaker.gsppkg \
+    --text "要合成的文本" \
+    --lang zh \
+    --chunk-length 24 \
+    --output output_trt.wav
 ```
 
 ---
@@ -167,6 +239,8 @@ python export_onnx.py \
 
 ### Create & Export Speaker
 
+**ONNX Backend:**
+
 ```cpp
 #include "GPTSoVITS/InferencePipeline.h"
 
@@ -174,6 +248,7 @@ python export_onnx.py \
 GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Full(
     "/path/to/model", GPTSoVITS::Model::DeviceType::kCUDA, 0);
 config.resources_path = "./res";
+config.backend = GPTSoVITS::Model::BackendType::kONNX;
 
 GPTSoVITS::InferencePipeline pipeline(config);
 
@@ -181,6 +256,24 @@ GPTSoVITS::InferencePipeline pipeline(config);
 pipeline.CreateSpeaker("my_speaker", "zh", "ref.wav", "参考文本");
 
 // Export to portable package
+pipeline.ExportSpeaker("my_speaker", "my_speaker.gsppkg");
+```
+
+**TensorRT Backend:**
+
+```cpp
+#include "GPTSoVITS/InferencePipeline.h"
+
+GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Full(
+    "/path/to/model", GPTSoVITS::Model::DeviceType::kCUDA, 0);
+config.resources_path = "./res";
+config.backend = GPTSoVITS::Model::BackendType::kTensorRT;
+config.engine_cache_dir = "./trt_cache";  // TensorRT engine cache
+
+GPTSoVITS::InferencePipeline pipeline(config);
+
+// TensorRT engines will be built automatically on first run
+pipeline.CreateSpeaker("my_speaker", "zh", "ref.wav", "参考文本");
 pipeline.ExportSpeaker("my_speaker", "my_speaker.gsppkg");
 ```
 
@@ -221,11 +314,29 @@ audio->SaveToFile("output.wav");
 
 ### Streaming Inference
 
+**ONNX Backend:**
+
 ```cpp
 #include "GPTSoVITS/EdgePipeline.h"
 #include "GPTSoVITS/StreamingPipeline.h"
 
 // Build EdgePipeline (shared models, can serve multiple StreamingPipelines)
+auto g2p = std::make_shared<GPTSoVITS::G2P::G2PPipline>();
+auto bert = std::make_unique<GPTSoVITS::Model::CNBertModel>();
+bert->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/bert.onnx",
+                                          "./res/bert_tokenizer.json", device);
+g2p->RegisterLangProcess("zh", std::make_unique<GPTSoVITS::G2P::G2PZH>(),
+                         std::move(bert), true);
+
+auto enc = std::make_shared<GPTSoVITS::Model::GPTEncoderModel>();
+enc->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/gpt_encoder.onnx", device);
+
+auto step = std::make_shared<GPTSoVITS::Model::GPTStepModel>();
+step->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/gpt_step.onnx", device);
+
+auto sovits = std::make_shared<GPTSoVITS::Model::SoVITSModel>();
+sovits->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/sovits.onnx", device);
+
 auto edge = std::make_shared<GPTSoVITS::EdgePipeline>(config_json, model_path,
                                                        g2p, enc, step, sovits);
 edge->ImportSpeaker("my_speaker.gsppkg", "my_speaker");
@@ -252,6 +363,52 @@ streaming->InferSpeakerStreaming(
     &stats);
 ```
 
+**TensorRT Backend:**
+
+```cpp
+#include "GPTSoVITS/EdgePipeline.h"
+#include "GPTSoVITS/StreamingPipeline.h"
+
+// Build EdgePipeline with TensorRT backend
+auto g2p = std::make_shared<GPTSoVITS::G2P::G2PPipline>();
+auto bert = std::make_unique<GPTSoVITS::Model::CNBertModel>();
+bert->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/bert.onnx",
+                                              "./res/bert_tokenizer.json", device);
+g2p->RegisterLangProcess("zh", std::make_unique<GPTSoVITS::G2P::G2PZH>(),
+                         std::move(bert), true);
+
+auto enc = std::make_shared<GPTSoVITS::Model::GPTEncoderModel>();
+enc->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/gpt_encoder.engine", device);
+
+auto step = std::make_shared<GPTSoVITS::Model::GPTStepModel>();
+step->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/gpt_step.engine", device);
+
+auto sovits = std::make_shared<GPTSoVITS::Model::SoVITSModel>();
+sovits->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/sovits.engine", device);
+
+auto edge = std::make_shared<GPTSoVITS::EdgePipeline>(config_json, model_path,
+                                                       g2p, enc, step, sovits);
+edge->ImportSpeaker("my_speaker.gsppkg", "my_speaker");
+
+// Same streaming configuration as ONNX
+GPTSoVITS::StreamingConfig stream_cfg;
+stream_cfg.chunk_length = 24;
+stream_cfg.pause_length = 0.3f;
+stream_cfg.h_len        = 512;
+stream_cfg.l_len        = 16;
+stream_cfg.enable_fade  = true;
+
+auto streaming = std::make_shared<GPTSoVITS::StreamingPipeline>(edge, stream_cfg);
+
+// Streaming callback remains the same
+streaming->InferSpeakerStreaming(
+    "my_speaker", "要合成的文本", "zh",
+    [](const GPTSoVITS::AudioChunk& chunk) {
+        // Process audio chunks in real-time
+    },
+    /*sample_config=*/{}, /*noise_scale=*/0.35f, /*speed=*/1.0f);
+```
+
 ---
 
 ## 💎 Key Optimizations
@@ -274,7 +431,7 @@ Lookahead + history window with linear crossfade at chunk boundaries. No clicks,
 - [x] **Streaming inference** with crossfade
 - [x] **Multi-language G2P** (ZH / EN / JA)
 - [x] **InferStats** — tokens/s, RTF, first-packet latency
-- [ ] **TensorRT** backend
+- [x] **TensorRT** backend
 - [ ] **INT8** quantization
 - [ ] **Language Bindings**:
     - [ ] C API

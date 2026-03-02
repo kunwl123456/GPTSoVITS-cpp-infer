@@ -188,16 +188,16 @@ struct ProfileDef {
 static std::vector<ProfileDef> GetProfileDefs(const std::string& model_stem) {
   if (model_stem == "bert") {
     return {
-      {"input_ids",      {1,1},   {1,128},  {1,512}},
-      {"attention_mask", {1,1},   {1,128},  {1,512}},
-      {"token_type_ids", {1,1},   {1,128},  {1,512}},
+      {"input_ids",      {1,1},   {1,100},  {1,256}},
+      {"attention_mask", {1,1},   {1,100},  {1,256}},
+      {"token_type_ids", {1,1},   {1,100},  {1,256}},
     };
   }
   if (model_stem == "gpt_encoder") {
     return {
-      {"phoneme_ids",  {1,1},       {1,100},       {1,512}},
-      {"prompts",      {1,1},       {1,50},        {1,512}},
-      {"bert_feature", {1,1024,1},  {1,1024,100},  {1,1024,512}},
+      {"phoneme_ids",  {1,1},       {1,100},       {1,256}},
+      {"prompts",      {1,1},       {1,150},       {1,300}},
+      {"bert_feature", {1,1024,1},  {1,1024,100},  {1,1024,256}},
     };
   }
   if (model_stem == "gpt_step") {
@@ -212,22 +212,22 @@ static std::vector<ProfileDef> GetProfileDefs(const std::string& model_stem) {
   }
   if (model_stem == "sovits") {
     return {
-      {"pred_semantic", {1,1,1},    {1,1,200},    {1,1,1000}},
-      {"text_seq",      {1,1},      {1,100},      {1,512}},
-      {"refer_spec",    {1,1025,1}, {1,1025,200}, {1,1025,1000}},
+      {"pred_semantic", {1,1,1},    {1,1,120},    {1,1,250}},
+      {"text_seq",      {1,1},      {1,50},       {1,100}},
+      {"refer_spec",    {1,1025,1}, {1,1025,280}, {1,1025,400}},
     };
   }
   if (model_stem == "ssl") {
-    return {{"audio", {1,16000}, {1,160000}, {1,800000}}};
+    return {{"audio", {1,16000}, {1,96000}, {1,200000}}};
   }
   if (model_stem == "vq_encoder") {
-    return {{"ssl_content", {1,768,50}, {1,768,500}, {1,768,5000}}};
+    return {{"ssl_content", {1,768,50}, {1,768,300}, {1,768,700}}};
   }
   if (model_stem == "spectrogram") {
-    return {{"audio", {1,1}, {1,48000}, {1,960000}}};
+    return {{"audio", {1,1}, {1,180000}, {1,400000}}};
   }
   if (model_stem == "sv_embedding") {
-    return {{"audio", {1,16000}, {1,48000}, {1,160000}}};
+    return {{"audio", {1,16000}, {1,90000}, {1,180000}}};
   }
   return {};
 }

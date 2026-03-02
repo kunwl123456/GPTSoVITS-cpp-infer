@@ -83,11 +83,11 @@ ExportSpeaker(.gsppkg)                      ↓
 
 ### Pipeline 模式
 
-| 模式 | 说明                           |
-|:-----|:-----------------------------|
-| **Edge Pipeline** | 纯推理，从 `.gsppkg` 加载说话人，显存占用最小 |
+| 模式                     | 说明                           |
+|:-----------------------|:-----------------------------|
+| **Edge Pipeline**      | 纯推理，从 `.gsppkg` 加载说话人，显存占用最小 |
 | **Streaming Pipeline** | 分块实时生成，带 CrossFade 去伪影       |
-| **Full Pipeline** | 说话人创建 + 推理，适合大部分场景           |
+| **Full Pipeline**      | 说话人创建 + 推理，适合大部分场景           |
 
 ### 模型栈
 
@@ -111,21 +111,31 @@ SoVITSModel      → 神经声码器 → PCM 音频
 ### 编译
 
 ```bash
-# CPU 构建
+# CPU 构建（仅 ONNX）
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
-# CUDA 构建（推荐）
+# CUDA 构建（ONNX）
 cmake -B build -S . \
-  -DENABLE_STATIC_RUNTIME=1 \
-  -DONNXRUNTIME_PATH=/path/to/onnxruntime \
   -DENABLE_CUDA=1 \
-  -DCUDNN_PATH=/path/to/cudnn \
-  -DCUDA_TOOLKIT_ROOT_DIR=/path/to/cuda
+  -DONNXRUNTIME_PATH=/path/to/onnxruntime \
+  -DCUDA_TOOLKIT_ROOT_DIR=/path/to/cuda \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+
+# TensorRT 构建
+cmake -B build -S . \
+  -DUSE_TENSORRT=1 \
+  -DENABLE_CUDA=1 \
+  -DTENSORRT_PATH=/path/to/tensorrt \
+  -DCUDA_TOOLKIT_ROOT_DIR=/path/to/cuda \
+  -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
 ### 第一步 — 导出模型（Python 侧）
+
+**ONNX 模型：**
 
 ```bash
 # 在 GPT-SoVITS_minimal_inference 仓库中执行
@@ -134,38 +144,101 @@ python export_onnx.py \
     --sovits_path "pretrained_models/SoVITS_weights_v2ProPlus/your_model.pth" \
     --cnhubert_base_path pretrained_models/chinese-hubert-base \
     --bert_path pretrained_models/chinese-roberta-wwm-ext-large \
-    --output_dir "onnx_export/my_model_fp16" \
+    --output_dir "onnx_export/my_onnx_model" \
     --max_len 1000 \
     --validate \
     --validation_device cuda
+
+# fp16优化
+python onnx_to_fp16.py \
+    --input_dir "onnx_export/my_onnx_model"
+    --output_dir "onnx_export/my_onnx_model_fp16"
+    
+```
+
+**TensorRT 模型：**
+
+```bash
+
+# C++ SDK 也可以自动构建 (测试功能)
+
+python onnx2trt.py \
+    --input_dir onnx_export/my_onnx_model \
+    --output_dir onnx_export/my_trt_model \
+    --shape_profile fitted \
+    --precision auto
+    
+
 ```
 
 ### 第二步 — 创建说话人数据包
 
+**ONNX：**
+
 ```bash
-./build/gpt_sovits_cpp_cloud_create_onnx \
-    --ref-audio ref.wav \
-    --ref-text "参考文本" \
-    --lang zh \
-    --speaker-name my_speaker \
-    --output my_speaker.gsppkg
+./build/example/gpt_sovits_cpp_cloud_create_onnx \
+    my_speaker \
+    ref.wav \
+    "参考文本" \
+    zh \
+    my_speaker.gsppkg
+```
+
+**TensorRT：**
+
+```bash
+./build/example/gpt_sovits_cpp_cloud_create_trt \
+    my_speaker \
+    ref.wav \
+    "参考文本" \
+    zh \
+    my_speaker.gsppkg
 ```
 
 ### 第三步 — 推理
 
-```bash
-# 分布式（边缘）推理
-./build/gpt_sovits_cpp_edge_inference_onnx \
-    --speaker-package my_speaker.gsppkg \
-    --text "要合成的文本" \
-    --output output.wav
+**ONNX 边缘推理：**
 
-# 流式推理
-./build/gpt_sovits_cpp_streaming_onnx \
+```bash
+./build/example/gpt_sovits_cpp_edge_inference_onnx \
+    my_speaker.gsppkg \
+    "要合成的文本" \
+    zh \
+    my_speaker \
+    output.wav
+```
+
+**ONNX 流式推理：**
+
+```bash
+./build/example/gpt_sovits_cpp_streaming_onnx \
     --speaker-package my_speaker.gsppkg \
     --text "要合成的文本" \
+    --lang zh \
     --chunk-length 24 \
     --output output.wav
+```
+
+**TensorRT 边缘推理：**
+
+```bash
+./build/example/gpt_sovits_cpp_edge_inference_trt \
+    my_speaker.gsppkg \
+    "要合成的文本" \
+    zh \
+    my_speaker \
+    output_trt.wav
+```
+
+**TensorRT 流式推理：**
+
+```bash
+./build/example/gpt_sovits_cpp_streaming_trt \
+    --speaker-package my_speaker.gsppkg \
+    --text "要合成的文本" \
+    --lang zh \
+    --chunk-length 24 \
+    --output output_trt.wav
 ```
 
 ---
@@ -174,6 +247,8 @@ python export_onnx.py \
 
 ### 创建并导出说话人
 
+**ONNX 后端：**
+
 ```cpp
 #include "GPTSoVITS/InferencePipeline.h"
 
@@ -181,6 +256,7 @@ python export_onnx.py \
 GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Full(
     "/path/to/model", GPTSoVITS::Model::DeviceType::kCUDA, 0);
 config.resources_path = "./res";
+config.backend = GPTSoVITS::Model::BackendType::kONNX;
 
 GPTSoVITS::InferencePipeline pipeline(config);
 
@@ -188,6 +264,24 @@ GPTSoVITS::InferencePipeline pipeline(config);
 pipeline.CreateSpeaker("my_speaker", "zh", "ref.wav", "参考文本");
 
 // 导出为可移植数据包
+pipeline.ExportSpeaker("my_speaker", "my_speaker.gsppkg");
+```
+
+**TensorRT 后端：**
+
+```cpp
+#include "GPTSoVITS/InferencePipeline.h"
+
+GPTSoVITS::PipelineConfig config = GPTSoVITS::PipelineConfig::Full(
+    "/path/to/model", GPTSoVITS::Model::DeviceType::kCUDA, 0);
+config.resources_path = "./res";
+config.backend = GPTSoVITS::Model::BackendType::kTensorRT;
+config.engine_cache_dir = "./trt_cache";  // TensorRT 引擎缓存目录
+
+GPTSoVITS::InferencePipeline pipeline(config);
+
+// TensorRT 引擎会在首次运行时自动构建
+pipeline.CreateSpeaker("my_speaker", "zh", "ref.wav", "参考文本");
 pipeline.ExportSpeaker("my_speaker", "my_speaker.gsppkg");
 ```
 
@@ -230,11 +324,29 @@ audio->SaveToFile("output.wav");
 
 ### 流式推理
 
+**ONNX 后端：**
+
 ```cpp
 #include "GPTSoVITS/EdgePipeline.h"
 #include "GPTSoVITS/StreamingPipeline.h"
 
 // 构建 EdgePipeline（模型可共享，支持多个 StreamingPipeline 复用）
+auto g2p = std::make_shared<GPTSoVITS::G2P::G2PPipline>();
+auto bert = std::make_unique<GPTSoVITS::Model::CNBertModel>();
+bert->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/bert.onnx",
+                                          "./res/bert_tokenizer.json", device);
+g2p->RegisterLangProcess("zh", std::make_unique<GPTSoVITS::G2P::G2PZH>(),
+                         std::move(bert), true);
+
+auto enc = std::make_shared<GPTSoVITS::Model::GPTEncoderModel>();
+enc->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/gpt_encoder.onnx", device);
+
+auto step = std::make_shared<GPTSoVITS::Model::GPTStepModel>();
+step->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/gpt_step.onnx", device);
+
+auto sovits = std::make_shared<GPTSoVITS::Model::SoVITSModel>();
+sovits->Init<GPTSoVITS::Model::ONNXBackend>(model_path + "/sovits.onnx", device);
+
 auto edge = std::make_shared<GPTSoVITS::EdgePipeline>(config_json, model_path,
                                                        g2p, enc, step, sovits);
 edge->ImportSpeaker("my_speaker.gsppkg", "my_speaker");
@@ -261,6 +373,52 @@ streaming->InferSpeakerStreaming(
     &stats);
 ```
 
+**TensorRT 后端：**
+
+```cpp
+#include "GPTSoVITS/EdgePipeline.h"
+#include "GPTSoVITS/StreamingPipeline.h"
+
+// 使用 TensorRT 后端构建 EdgePipeline
+auto g2p = std::make_shared<GPTSoVITS::G2P::G2PPipline>();
+auto bert = std::make_unique<GPTSoVITS::Model::CNBertModel>();
+bert->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/bert.onnx",
+                                              "./res/bert_tokenizer.json", device);
+g2p->RegisterLangProcess("zh", std::make_unique<GPTSoVITS::G2P::G2PZH>(),
+                         std::move(bert), true);
+
+auto enc = std::make_shared<GPTSoVITS::Model::GPTEncoderModel>();
+enc->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/gpt_encoder.engine", device);
+
+auto step = std::make_shared<GPTSoVITS::Model::GPTStepModel>();
+step->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/gpt_step.engine", device);
+
+auto sovits = std::make_shared<GPTSoVITS::Model::SoVITSModel>();
+sovits->Init<GPTSoVITS::Model::TensorRTBackend>(model_path + "/sovits.engine", device);
+
+auto edge = std::make_shared<GPTSoVITS::EdgePipeline>(config_json, model_path,
+                                                       g2p, enc, step, sovits);
+edge->ImportSpeaker("my_speaker.gsppkg", "my_speaker");
+
+// 流式配置与 ONNX 相同
+GPTSoVITS::StreamingConfig stream_cfg;
+stream_cfg.chunk_length = 24;
+stream_cfg.pause_length = 0.3f;
+stream_cfg.h_len        = 512;
+stream_cfg.l_len        = 16;
+stream_cfg.enable_fade  = true;
+
+auto streaming = std::make_shared<GPTSoVITS::StreamingPipeline>(edge, stream_cfg);
+
+// 流式回调保持不变
+streaming->InferSpeakerStreaming(
+    "my_speaker", "要合成的文本", "zh",
+    [](const GPTSoVITS::AudioChunk& chunk) {
+        // 实时处理音频块
+    },
+    /*sample_config=*/{}, /*noise_scale=*/0.35f, /*speed=*/1.0f);
+```
+
 ---
 
 ## 💎 核心优化
@@ -283,7 +441,7 @@ Lookahead + History Window 机制，在 Chunk 边界进行线性加权融合（C
 - [x] **流式推理**（带 CrossFade）
 - [x] **多语言 G2P**（中文 / 英文 / 日文）
 - [x] **InferStats** — tokens/s、RTF、首包延迟
-- [ ] **TensorRT** 后端
+- [x] **TensorRT** 后端
 - [ ] **INT8** 量化
 - [ ] **多语言绑定**：
     - [ ] C API
