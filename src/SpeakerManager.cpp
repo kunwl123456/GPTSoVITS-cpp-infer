@@ -15,6 +15,10 @@
 #include "GPTSoVITS/model/bert.h"
 #include "GPTSoVITS/plog.h"
 
+#ifdef WITH_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace GPTSoVITS {
 
 SpeakerManager& SpeakerManager::Instance() {
@@ -95,6 +99,7 @@ SpeakerFeatures* SpeakerManager::CreateSpeaker(
 
     // 获取设备
     Model::Device device = device_ctx_ ? device_ctx_->GetDevice() : Model::Device(Model::DeviceType::kCPU);
+    bool is_gpu = device.type == Model::DeviceType::kCUDA;
 
     // SSL 提取
     auto ssl_model = model_pool_->GetModel<Model::SSLModel>(Model::ModelType::kSSL);
@@ -112,16 +117,30 @@ SpeakerFeatures* SpeakerManager::CreateSpeaker(
     }
     auto vq_codes = vq_model->GetVQCodes(ssl_content.get());
 
-    // 处理 VQ codes 形状
+    // 处理 VQ codes 形状并保留 GPU 副本
     if (vq_codes && vq_codes->Shape().size() == 3) {
       auto shape = vq_codes->Shape();
-      auto sliced = Model::Tensor::Empty({1, shape[2]}, Model::DataType::kInt64, Model::DeviceType::kCPU);
-      auto vq_cpu = vq_codes->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
-      std::memcpy(sliced->Data<int64_t>(), vq_cpu->Data<int64_t>(), shape[2] * sizeof(int64_t));
-      vq_codes = std::move(sliced);
-    }
 
-    features->SetVQCodes(std::move(vq_codes));
+      // 创建 CPU 副本用于序列化
+      auto sliced_cpu = Model::Tensor::Empty({1, shape[2]}, Model::DataType::kInt64, Model::DeviceType::kCPU);
+      auto vq_cpu = vq_codes->To(Model::Device(Model::DeviceType::kCPU), Model::DataType::kInt64);
+      std::memcpy(sliced_cpu->Data<int64_t>(), vq_cpu->Data<int64_t>(), shape[2] * sizeof(int64_t));
+
+      // 如果在 GPU 上，保留 GPU 副本
+      std::unique_ptr<Model::Tensor> sliced_gpu;
+      if (is_gpu && !vq_codes->IsCPU()) {
+        sliced_gpu = Model::Tensor::Empty({1, shape[2]}, Model::DataType::kInt64, device);
+        auto vq_gpu = vq_codes->To(device, Model::DataType::kInt64);
+#ifdef WITH_CUDA
+        // 直接在 GPU 上切片
+        cudaMemcpy(sliced_gpu->Data(), vq_gpu->Data(), shape[2] * sizeof(int64_t), cudaMemcpyDeviceToDevice);
+#endif
+      }
+
+      features->SetVQCodesWithCache(std::move(sliced_cpu), std::move(sliced_gpu));
+    } else {
+      features->SetVQCodes(std::move(vq_codes));
+    }
 
     // 频谱图
     auto spectrogram_model = model_pool_->GetModel<Model::SpectrogramModel>(Model::ModelType::kSpectrogram);
@@ -131,7 +150,15 @@ SpeakerFeatures* SpeakerManager::CreateSpeaker(
       if (refer_spec && refer_spec->Shape().size() == 3) {
         refer_spec->Reshape({refer_spec->Shape()[1], refer_spec->Shape()[2]});
       }
-      features->SetReferSpec(std::move(refer_spec));
+
+      // 保留 GPU 副本
+      if (is_gpu && refer_spec && !refer_spec->IsCPU()) {
+        auto spec_gpu = refer_spec->Clone();
+        auto spec_cpu = refer_spec->ToCPU();
+        features->SetReferSpecWithCache(std::move(spec_cpu), std::move(spec_gpu));
+      } else {
+        features->SetReferSpec(std::move(refer_spec));
+      }
     }
 
     // SV Embedding
@@ -141,7 +168,15 @@ SpeakerFeatures* SpeakerManager::CreateSpeaker(
       if (sv_emb && sv_emb->Shape().size() == 2) {
         sv_emb->Reshape({sv_emb->Shape()[1]});
       }
-      features->SetSVEmbedding(std::move(sv_emb));
+
+      // 保留 GPU 副本
+      if (is_gpu && sv_emb && !sv_emb->IsCPU()) {
+        auto emb_gpu = sv_emb->Clone();
+        auto emb_cpu = sv_emb->ToCPU();
+        features->SetSVEmbeddingWithCache(std::move(emb_cpu), std::move(emb_gpu));
+      } else {
+        features->SetSVEmbedding(std::move(sv_emb));
+      }
     }
 
     // BERT 特征提取（参考文本的音素和BERT特征）

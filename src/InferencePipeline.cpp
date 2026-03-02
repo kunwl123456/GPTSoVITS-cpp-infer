@@ -242,6 +242,12 @@ public:
       PrintError("[InferencePipeline] Speaker features incomplete");
       return nullptr;
     }
+
+    // 缓存命中
+    if (device.type == Model::DeviceType::kCUDA) {
+      PrintDebug("[InferencePipeline] Using GPU-cached speaker features (zero-copy)");
+    }
+
     PrintDebug("[InferencePipeline] ref_phones={}, ref_bert={}",
                ref_phones ? fmt::format("[{}]", fmt::join(ref_phones->Shape(), ",")) : "null",
                ref_bert   ? fmt::format("[{}]", fmt::join(ref_bert->Shape(),   ",")) : "null");

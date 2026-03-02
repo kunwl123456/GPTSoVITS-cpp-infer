@@ -6,8 +6,8 @@
 #include "GPTSoVITS/model/base.h"
 
 namespace Ort {
-class Session;
-class Env;
+struct Session;
+struct Env;
 }  // namespace Ort
 
 namespace GPTSoVITS::Model {

@@ -166,6 +166,47 @@ void DeviceContext::Deallocate(void* ptr) {
   PrintDebug("[DeviceContext] Deallocated memory at {}", ptr);
 }
 
+void* DeviceContext::AllocatePinned(size_t size) {
+  if (size == 0) return nullptr;
+
+  void* ptr = nullptr;
+
+#ifdef WITH_CUDA
+  if (impl_->current_device.type == Model::DeviceType::kCUDA) {
+    cudaSetDevice(impl_->current_device.device_id);
+    cudaError_t err = cudaHostAlloc(&ptr, size, cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+      PrintError("[DeviceContext] Pinned memory allocation failed: {}", cudaGetErrorString(err));
+      return nullptr;
+    }
+    PrintDebug("[DeviceContext] Allocated {} bytes pinned memory at {}", size, ptr);
+    return ptr;
+  }
+#endif
+
+  // Fallback to regular allocation for CPU
+  ptr = std::malloc(size);
+  if (!ptr) {
+    PrintError("[DeviceContext] Pinned memory fallback allocation failed for {} bytes", size);
+  }
+  return ptr;
+}
+
+void DeviceContext::DeallocatePinned(void* ptr) {
+  if (!ptr) return;
+
+#ifdef WITH_CUDA
+  if (impl_->current_device.type == Model::DeviceType::kCUDA) {
+    cudaFreeHost(ptr);
+    PrintDebug("[DeviceContext] Deallocated pinned memory at {}", ptr);
+    return;
+  }
+#endif
+
+  // Fallback for CPU
+  std::free(ptr);
+}
+
 size_t DeviceContext::GetAllocatedSize() const {
   return impl_->allocated_size;
 }

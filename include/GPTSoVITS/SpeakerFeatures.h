@@ -171,6 +171,26 @@ public:
    */
   void SetFromBertRes(std::shared_ptr<Bert::BertRes> bert_res);
 
+  /**
+   * @brief 设置 VQ 编码
+   * @param cpu_tensor CPU 张量（用于序列化）
+   * @param gpu_tensor GPU 张量（用于推理，可选）
+   */
+  void SetVQCodesWithCache(std::unique_ptr<Model::Tensor> cpu_tensor,
+                           std::unique_ptr<Model::Tensor> gpu_tensor = nullptr);
+
+  /**
+   * @brief 设置参考频谱图
+   */
+  void SetReferSpecWithCache(std::unique_ptr<Model::Tensor> cpu_tensor,
+                             std::unique_ptr<Model::Tensor> gpu_tensor = nullptr);
+
+  /**
+   * @brief 设置说话人验证嵌入
+   */
+  void SetSVEmbeddingWithCache(std::unique_ptr<Model::Tensor> cpu_tensor,
+                               std::unique_ptr<Model::Tensor> gpu_tensor = nullptr);
+
   // ============ 设备管理 ============
 
   /**

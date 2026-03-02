@@ -144,6 +144,19 @@ public:
   void Deallocate(void* ptr);
 
   /**
+   * @brief 分配 pinned memory
+   * @param size 字节数
+   * @return 内存指针
+   */
+  void* AllocatePinned(size_t size);
+
+  /**
+   * @brief 释放 pinned memory
+   * @param ptr 内存指针
+   */
+  void DeallocatePinned(void* ptr);
+
+  /**
    * @brief 获取已分配内存大小
    */
   [[nodiscard]] size_t GetAllocatedSize() const;

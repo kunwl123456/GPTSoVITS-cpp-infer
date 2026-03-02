@@ -237,6 +237,50 @@ void SpeakerFeatures::SetFromBertRes(std::shared_ptr<Bert::BertRes> bert_res) {
   impl_->bert_seq_cache.clear();
 }
 
+void SpeakerFeatures::SetVQCodesWithCache(
+    std::unique_ptr<Model::Tensor> cpu_tensor,
+    std::unique_ptr<Model::Tensor> gpu_tensor) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+
+  // 设置 CPU 副本
+  impl_->vq_codes_cpu = std::move(cpu_tensor);
+  impl_->vq_codes_cache.clear();
+
+  // 如果提供了 GPU 副本，直接缓存
+  if (gpu_tensor && !gpu_tensor->IsCPU()) {
+    auto key = Impl::MakeKey(gpu_tensor->GetDevice());
+    impl_->vq_codes_cache[key] = std::move(gpu_tensor);
+  }
+}
+
+void SpeakerFeatures::SetReferSpecWithCache(
+    std::unique_ptr<Model::Tensor> cpu_tensor,
+    std::unique_ptr<Model::Tensor> gpu_tensor) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+
+  impl_->refer_spec_cpu = std::move(cpu_tensor);
+  impl_->refer_spec_cache.clear();
+
+  if (gpu_tensor && !gpu_tensor->IsCPU()) {
+    auto key = Impl::MakeKey(gpu_tensor->GetDevice());
+    impl_->refer_spec_cache[key] = std::move(gpu_tensor);
+  }
+}
+
+void SpeakerFeatures::SetSVEmbeddingWithCache(
+    std::unique_ptr<Model::Tensor> cpu_tensor,
+    std::unique_ptr<Model::Tensor> gpu_tensor) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+
+  impl_->sv_emb_cpu = std::move(cpu_tensor);
+  impl_->sv_emb_cache.clear();
+
+  if (gpu_tensor && !gpu_tensor->IsCPU()) {
+    auto key = Impl::MakeKey(gpu_tensor->GetDevice());
+    impl_->sv_emb_cache[key] = std::move(gpu_tensor);
+  }
+}
+
 // ============ 设备管理 ============
 
 void SpeakerFeatures::EnsureOnDevice(Model::Device device) {
