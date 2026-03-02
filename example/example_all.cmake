@@ -30,6 +30,13 @@ if (USE_TENSORRT)
 
   add_executable(gpt_sovits_cpp_edge_inference_trt example/tensorrt/edge_inference.cpp)
   target_link_libraries(gpt_sovits_cpp_edge_inference_trt PUBLIC gsv_lib)
+  
+  # NVTX profiling support
+  if (USE_NVTX)
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(gpt_sovits_cpp_edge_inference_trt PRIVATE USE_NVTX)
+    target_link_libraries(gpt_sovits_cpp_edge_inference_trt PRIVATE CUDA::nvtx3)
+  endif()
 
 endif ()
 

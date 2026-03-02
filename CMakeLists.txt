@@ -39,6 +39,7 @@ option(USE_ONNX "Build with ONNX Runtime backend" ON)
 option(USE_TENSORRT "Build with TensorRT backend" OFF)
 option(ENABLE_CUDA "Enable CUDA support" OFF)
 option(USE_U8PATH "Enable u8path support" ON)
+option(USE_NVTX "Enable NVTX profiling markers" OFF)
 # TODO: 预留其他后端选项,如 USE_OPENVINO
 
 # TensorRT 必须依赖 CUDA

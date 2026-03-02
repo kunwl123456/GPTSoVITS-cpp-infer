@@ -13,6 +13,10 @@
 #include "GPTSoVITS/InferencePipeline.h"
 #include "GPTSoVITS/model/sample_config.h"
 
+#ifdef USE_NVTX
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 #ifdef _WIN32
 #define HOST_WINDOWS
 #endif
@@ -97,12 +101,22 @@ int main(int argc, char* argv[]) {
     auto t_start = std::chrono::steady_clock::now();
     GPTSoVITS::Model::InferStats stats;
     double first_segment_latency_ms = 0.0;
+    
+#ifdef USE_NVTX
+    nvtxRangePush("Benchmark_Inference");
+#endif
+    
     auto audio   = pipeline.Infer(speaker_name, text, text_lang, {}, 0.5f, 1.0f, &stats,
                                   [&]() {
                                     first_segment_latency_ms =
                                         std::chrono::duration<double, std::milli>(
                                             std::chrono::steady_clock::now() - t_start).count();
                                   });
+    
+#ifdef USE_NVTX
+    nvtxRangePop();
+#endif
+    
     auto t_end   = std::chrono::steady_clock::now();
 
     if (!audio) {
