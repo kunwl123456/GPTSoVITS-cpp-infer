@@ -117,27 +117,27 @@ public:
    * @param target_device 目标设备（如果数据不在该设备上，会自动迁移）
    * @return 音素序列 Tensor 指针
    */
-  Model::Tensor* GetPhoneSeq(Model::Device target_device);
+  Model::Tensor* GetPhoneSeq(Model::Device target_device, Model::DataType dtype = Model::DataType::kFloat32);
 
   /**
    * @brief 获取 BERT 特征序列
    */
-  Model::Tensor* GetBertSeq(Model::Device target_device);
+  Model::Tensor* GetBertSeq(Model::Device target_device, Model::DataType dtype = Model::DataType::kFloat32);
 
   /**
    * @brief 获取 VQ 编码
    */
-  Model::Tensor* GetVQCodes(Model::Device target_device);
+  Model::Tensor* GetVQCodes(Model::Device target_device, Model::DataType dtype = Model::DataType::kFloat32);
 
   /**
    * @brief 获取参考频谱图
    */
-  Model::Tensor* GetReferSpec(Model::Device target_device);
+  Model::Tensor* GetReferSpec(Model::Device target_device, Model::DataType dtype = Model::DataType::kFloat32);
 
   /**
    * @brief 获取说话人验证嵌入
    */
-  Model::Tensor* GetSVEmbedding(Model::Device target_device);
+  Model::Tensor* GetSVEmbedding(Model::Device target_device, Model::DataType dtype = Model::DataType::kFloat32);
 
   // ============ 特征设置 ============
 
@@ -195,8 +195,10 @@ public:
 
   /**
    * @brief 迁移到指定设备（保留 CPU 原始数据，创建设备缓存）
+   * @param device 目标设备
+   * @param dtype 目标数据类型，默认为kFloat32
    */
-  void EnsureOnDevice(Model::Device device);
+  void EnsureOnDevice(Model::Device device, Model::DataType dtype = Model::DataType::kFloat32);
 
   /**
    * @brief 释放设备缓存（保留 CPU 原始数据）

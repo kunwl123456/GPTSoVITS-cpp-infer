@@ -231,27 +231,6 @@ public:
       return nullptr;
     }
     
-    // 获取说话人特征
-    auto ref_phones = speaker.GetPhoneSeq(device);
-    auto ref_bert = speaker.GetBertSeq(device);
-    auto vq_codes = speaker.GetVQCodes(device);
-    auto refer_spec = speaker.GetReferSpec(device);
-    auto sv_emb = speaker.GetSVEmbedding(device);
-
-    if (!vq_codes || !refer_spec || !sv_emb) {
-      PrintError("[InferencePipeline] Speaker features incomplete");
-      return nullptr;
-    }
-
-    // 缓存命中
-    if (device.type == Model::DeviceType::kCUDA) {
-      PrintDebug("[InferencePipeline] Using GPU-cached speaker features (zero-copy)");
-    }
-
-    PrintDebug("[InferencePipeline] ref_phones={}, ref_bert={}",
-               ref_phones ? fmt::format("[{}]", fmt::join(ref_phones->Shape(), ",")) : "null",
-               ref_bert   ? fmt::format("[{}]", fmt::join(ref_bert->Shape(),   ",")) : "null");
-
     // 获取模型
     auto gpt_encoder = model_pool.GetModel<Model::GPTEncoderModel>(
         Model::ModelType::kGPTEncoder);
@@ -268,6 +247,27 @@ public:
     auto target_device = gpt_encoder->GetModel()->GetDevice();
     auto phone_dtype = gpt_encoder->GetModel()->GetInputDataType("phoneme_ids");
     auto bert_dtype = gpt_encoder->GetModel()->GetInputDataType("bert_feature");
+
+    // 获取说话人特征
+    auto ref_phones = speaker.GetPhoneSeq(device, phone_dtype);
+    auto ref_bert = speaker.GetBertSeq(device, bert_dtype);
+    auto vq_codes = speaker.GetVQCodes(device, phone_dtype);  // VQ codes使用phone_dtype
+    auto refer_spec = speaker.GetReferSpec(device, Model::DataType::kFloat32);  // refer_spec通常为FP32
+    auto sv_emb = speaker.GetSVEmbedding(device, Model::DataType::kFloat32);    // sv_emb通常为FP32
+
+    if (!vq_codes || !refer_spec || !sv_emb) {
+      PrintError("[InferencePipeline] Speaker features incomplete");
+      return nullptr;
+    }
+
+    // 缓存命中
+    if (device.type == Model::DeviceType::kCUDA) {
+      PrintDebug("[InferencePipeline] Using GPU-cached speaker features (zero-copy)");
+    }
+
+    PrintDebug("[InferencePipeline] ref_phones={}, ref_bert={}",
+               ref_phones ? fmt::format("[{}]", fmt::join(ref_phones->Shape(), ",")) : "null",
+               ref_bert   ? fmt::format("[{}]", fmt::join(ref_bert->Shape(),   ",")) : "null");
 
     // ================================================================
     // 准备 GPT Encoder 输入
@@ -764,8 +764,8 @@ std::unique_ptr<AudioTools> InferencePipeline::Infer(
   
   PrintInfo("[InferencePipeline] Processing {} segments", segments.size());
   
-  // 预加载说话人特征到设备
-  speaker->EnsureOnDevice(impl_->device_ctx->GetDevice());
+  // 预加载说话人特征到设备（使用模型检测的精度）
+  speaker->EnsureOnDevice(impl_->device_ctx->GetDevice(), impl_->compute_precision);
   
   // 处理每个段落
   std::vector<float> final_audio;
@@ -1020,9 +1020,9 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
   loudness_config.peak_threshold = 0.9f;
   LoudnessNormalizer loudness_normalizer(loudness_config);
   
-  // 预加载说话人特征到设备
+  // 预加载说话人特征到设备（使用模型检测的精度）
   auto device = impl_->device_ctx->GetDevice();
-  speaker->EnsureOnDevice(device);
+  speaker->EnsureOnDevice(device, impl_->compute_precision);
   // 获取模型
   auto gpt_encoder = impl_->model_pool.GetModel<Model::GPTEncoderModel>(
       Model::ModelType::kGPTEncoder);
@@ -1034,15 +1034,19 @@ bool InferencePipeline::InferStreaming(const std::string& speaker_name,
     PrintError("[InferencePipeline::InferStreaming] Models not loaded");
     return false;
   }
+  // 获取模型期望的数据类型
+  auto phone_dtype = gpt_encoder->GetModel()->GetInputDataType("phoneme_ids");
+  auto bert_dtype = gpt_encoder->GetModel()->GetInputDataType("bert_feature");
+  
   // 流推理配置
   StreamingConfigInternal stream_config;
-  // 获取说话人特征
+  // 获取说话人特征（使用模型期望的数据类型）
   auto ref_phones =
-      speaker->GetPhoneSeq(Model::Device(Model::DeviceType::kCPU));
-  auto ref_bert = speaker->GetBertSeq(Model::Device(Model::DeviceType::kCPU));
-  auto vq_codes = speaker->GetVQCodes(device);
-  auto refer_spec = speaker->GetReferSpec(device);
-  auto sv_emb = speaker->GetSVEmbedding(device);
+      speaker->GetPhoneSeq(Model::Device(Model::DeviceType::kCPU), phone_dtype);
+  auto ref_bert = speaker->GetBertSeq(Model::Device(Model::DeviceType::kCPU), bert_dtype);
+  auto vq_codes = speaker->GetVQCodes(device, phone_dtype);  // VQ codes使用phone_dtype
+  auto refer_spec = speaker->GetReferSpec(device, Model::DataType::kFloat32);  // refer_spec通常为FP32
+  auto sv_emb = speaker->GetSVEmbedding(device, Model::DataType::kFloat32);    // sv_emb通常为FP32
   if (!vq_codes || !refer_spec || !sv_emb) {
     PrintError(
         "[InferencePipeline::InferStreaming] Speaker features incomplete");

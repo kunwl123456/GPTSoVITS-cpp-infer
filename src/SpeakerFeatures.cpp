@@ -16,9 +16,10 @@ namespace GPTSoVITS {
 struct DeviceCacheKey {
   Model::DeviceType type;
   int device_id;
+  Model::DataType dtype;
 
   bool operator==(const DeviceCacheKey& other) const {
-    return type == other.type && device_id == other.device_id;
+    return type == other.type && device_id == other.device_id && dtype == other.dtype;
   }
 };
 
@@ -29,7 +30,7 @@ namespace std {
 template <>
 struct hash<GPTSoVITS::DeviceCacheKey> {
   size_t operator()(const GPTSoVITS::DeviceCacheKey& k) const {
-    return hash<int>()(static_cast<int>(k.type)) ^ hash<int>()(k.device_id);
+    return hash<int>()(static_cast<int>(k.type)) ^ hash<int>()(k.device_id) ^ hash<int>()(static_cast<int>(k.dtype));
   }
 };
 }  // namespace std
@@ -64,15 +65,16 @@ public:
   }
 
   // 获取设备缓存键
-  static DeviceCacheKey MakeKey(const Model::Device& device) {
-    return {device.type, device.device_id};
+  static DeviceCacheKey MakeKey(const Model::Device& device, Model::DataType dtype = Model::DataType::kFloat32) {
+    return {device.type, device.device_id, dtype};
   }
 
   // 获取或创建设备缓存
   Model::Tensor* GetOrCreateCache(
       std::unique_ptr<Model::Tensor>& cpu_data,
       std::unordered_map<DeviceCacheKey, std::unique_ptr<Model::Tensor>>& cache,
-      const Model::Device& device) {
+      const Model::Device& device,
+      Model::DataType dtype = Model::DataType::kFloat32) {
     if (!cpu_data) return nullptr;
 
     // CPU 设备直接返回原始数据，不使用缓存
@@ -81,16 +83,16 @@ public:
     }
 
     // 非 CPU 设备检查缓存
-    auto key = MakeKey(device);
+    auto key = MakeKey(device, dtype);
     auto it = cache.find(key);
     if (it != cache.end()) {
       return it->second.get();
     }
 
-    // 创建设备缓存
-    auto device_tensor = cpu_data->ToDevice(device);
+    // 创建设备缓存（同时转换数据类型）
+    auto device_tensor = cpu_data->To(device, dtype);
     if (!device_tensor) {
-      PrintError("[SpeakerFeatures] Failed to move tensor to device");
+      PrintError("[SpeakerFeatures] Failed to move tensor to device with dtype");
       return nullptr;
     }
 
@@ -132,29 +134,29 @@ void SpeakerFeatures::SetMetadata(const SpeakerMetadata& metadata) {
 
 // ============ 特征访问 ============
 
-Model::Tensor* SpeakerFeatures::GetPhoneSeq(Model::Device target_device) {
+Model::Tensor* SpeakerFeatures::GetPhoneSeq(Model::Device target_device, Model::DataType dtype) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->GetOrCreateCache(impl_->phone_seq_cpu, impl_->phone_seq_cache, target_device);
+  return impl_->GetOrCreateCache(impl_->phone_seq_cpu, impl_->phone_seq_cache, target_device, dtype);
 }
 
-Model::Tensor* SpeakerFeatures::GetBertSeq(Model::Device target_device) {
+Model::Tensor* SpeakerFeatures::GetBertSeq(Model::Device target_device, Model::DataType dtype) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->GetOrCreateCache(impl_->bert_seq_cpu, impl_->bert_seq_cache, target_device);
+  return impl_->GetOrCreateCache(impl_->bert_seq_cpu, impl_->bert_seq_cache, target_device, dtype);
 }
 
-Model::Tensor* SpeakerFeatures::GetVQCodes(Model::Device target_device) {
+Model::Tensor* SpeakerFeatures::GetVQCodes(Model::Device target_device, Model::DataType dtype) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->GetOrCreateCache(impl_->vq_codes_cpu, impl_->vq_codes_cache, target_device);
+  return impl_->GetOrCreateCache(impl_->vq_codes_cpu, impl_->vq_codes_cache, target_device, dtype);
 }
 
-Model::Tensor* SpeakerFeatures::GetReferSpec(Model::Device target_device) {
+Model::Tensor* SpeakerFeatures::GetReferSpec(Model::Device target_device, Model::DataType dtype) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->GetOrCreateCache(impl_->refer_spec_cpu, impl_->refer_spec_cache, target_device);
+  return impl_->GetOrCreateCache(impl_->refer_spec_cpu, impl_->refer_spec_cache, target_device, dtype);
 }
 
-Model::Tensor* SpeakerFeatures::GetSVEmbedding(Model::Device target_device) {
+Model::Tensor* SpeakerFeatures::GetSVEmbedding(Model::Device target_device, Model::DataType dtype) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->GetOrCreateCache(impl_->sv_emb_cpu, impl_->sv_emb_cache, target_device);
+  return impl_->GetOrCreateCache(impl_->sv_emb_cpu, impl_->sv_emb_cache, target_device, dtype);
 }
 
 // ============ 特征设置 ============
@@ -283,40 +285,54 @@ void SpeakerFeatures::SetSVEmbeddingWithCache(
 
 // ============ 设备管理 ============
 
-void SpeakerFeatures::EnsureOnDevice(Model::Device device) {
+void SpeakerFeatures::EnsureOnDevice(Model::Device device, Model::DataType dtype) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
 
-  // 预热所有缓存
+  // 预热所有缓存（使用指定数据类型）
   if (device.type != Model::DeviceType::kCPU) {
-    if (impl_->phone_seq_cpu && impl_->phone_seq_cache.find(Impl::MakeKey(device)) == impl_->phone_seq_cache.end()) {
-      impl_->phone_seq_cache[Impl::MakeKey(device)] = impl_->phone_seq_cpu->ToDevice(device);
+    auto key = Impl::MakeKey(device, dtype);
+    if (impl_->phone_seq_cpu && impl_->phone_seq_cache.find(key) == impl_->phone_seq_cache.end()) {
+      impl_->phone_seq_cache[key] = impl_->phone_seq_cpu->To(device, dtype);
     }
-    if (impl_->bert_seq_cpu && impl_->bert_seq_cache.find(Impl::MakeKey(device)) == impl_->bert_seq_cache.end()) {
-      impl_->bert_seq_cache[Impl::MakeKey(device)] = impl_->bert_seq_cpu->ToDevice(device);
+    if (impl_->bert_seq_cpu && impl_->bert_seq_cache.find(key) == impl_->bert_seq_cache.end()) {
+      impl_->bert_seq_cache[key] = impl_->bert_seq_cpu->To(device, dtype);
     }
-    if (impl_->vq_codes_cpu && impl_->vq_codes_cache.find(Impl::MakeKey(device)) == impl_->vq_codes_cache.end()) {
-      impl_->vq_codes_cache[Impl::MakeKey(device)] = impl_->vq_codes_cpu->ToDevice(device);
+    if (impl_->vq_codes_cpu && impl_->vq_codes_cache.find(key) == impl_->vq_codes_cache.end()) {
+      impl_->vq_codes_cache[key] = impl_->vq_codes_cpu->To(device, dtype);
     }
-    if (impl_->refer_spec_cpu && impl_->refer_spec_cache.find(Impl::MakeKey(device)) == impl_->refer_spec_cache.end()) {
-      impl_->refer_spec_cache[Impl::MakeKey(device)] = impl_->refer_spec_cpu->ToDevice(device);
+    if (impl_->refer_spec_cpu && impl_->refer_spec_cache.find(key) == impl_->refer_spec_cache.end()) {
+      impl_->refer_spec_cache[key] = impl_->refer_spec_cpu->To(device, dtype);
     }
-    if (impl_->sv_emb_cpu && impl_->sv_emb_cache.find(Impl::MakeKey(device)) == impl_->sv_emb_cache.end()) {
-      impl_->sv_emb_cache[Impl::MakeKey(device)] = impl_->sv_emb_cpu->ToDevice(device);
+    if (impl_->sv_emb_cpu && impl_->sv_emb_cache.find(key) == impl_->sv_emb_cache.end()) {
+      impl_->sv_emb_cache[key] = impl_->sv_emb_cpu->To(device, dtype);
     }
   }
 
-  PrintDebug("[SpeakerFeatures] Ensured features on device for speaker: {}", impl_->metadata.name);
+  PrintDebug("[SpeakerFeatures] Ensured features on device {} with dtype {} for speaker: {}", 
+             device.type == Model::DeviceType::kCUDA ? "CUDA" : "CPU",
+             dtype == Model::DataType::kFloat16 ? "FP16" : "FP32",
+             impl_->metadata.name);
 }
 
 void SpeakerFeatures::ReleaseDeviceCache(Model::Device device) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
 
-  auto key = Impl::MakeKey(device);
-  impl_->phone_seq_cache.erase(key);
-  impl_->bert_seq_cache.erase(key);
-  impl_->vq_codes_cache.erase(key);
-  impl_->refer_spec_cache.erase(key);
-  impl_->sv_emb_cache.erase(key);
+  // 删除该设备上所有数据类型的缓存
+  auto remove_by_device = [&device](auto& cache_map) {
+    for (auto it = cache_map.begin(); it != cache_map.end(); ) {
+      if (it->first.type == device.type && it->first.device_id == device.device_id) {
+        it = cache_map.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  };
+
+  remove_by_device(impl_->phone_seq_cache);
+  remove_by_device(impl_->bert_seq_cache);
+  remove_by_device(impl_->vq_codes_cache);
+  remove_by_device(impl_->refer_spec_cache);
+  remove_by_device(impl_->sv_emb_cache);
 
   PrintDebug("[SpeakerFeatures] Released device cache for speaker: {}", impl_->metadata.name);
 }

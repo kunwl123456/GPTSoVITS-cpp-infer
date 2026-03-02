@@ -7,6 +7,7 @@
 #ifndef GPT_SOVITS_CPP_INFERENCE_PIPELINE_H
 #define GPT_SOVITS_CPP_INFERENCE_PIPELINE_H
 
+#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
 #include <filesystem>
 #include <functional>
 #include <memory>
