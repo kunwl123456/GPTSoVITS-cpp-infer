@@ -239,6 +239,50 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   const int max_steps = 1500;
   auto ctx = gpt_step_model->CreateContext(*encoder_output.kv_cache, max_steps, top_k);
 
+  // P0-1: CUDA 设备下启用 GPU 采样，将 softmax+采样移到 GPU，消除每步 D2H 同步
+  const bool use_gpu_sampling = (target_device.type == Model::DeviceType::kCUDA);
+  if (use_gpu_sampling) {
+    if (!gpt_step_model->EnableGPUSampling(ctx.get())) {
+      PrintWarn("[StreamingPipeline] Failed to enable GPU sampling, falling back to CPU");
+    }
+  }
+
+  // P1-3: 在 segment 级别预转换说话人特征，所有 chunk 复用，避免每次 DecodeChunk 重复 ->To()
+  auto sovits_model_ptr = m_edge_pipeline->GetSoVITSModel();
+  auto sovits_target_device = sovits_model_ptr->GetModel()->GetDevice();
+  auto spec_dtype = sovits_model_ptr->GetModel()->GetInputDataType("refer_spec");
+  auto sv_dtype   = sovits_model_ptr->GetModel()->GetInputDataType("sv_emb");
+  auto text_dtype = sovits_model_ptr->GetModel()->GetInputDataType("text_seq");
+
+  // refer_spec
+  auto refer_shape = speaker_info.m_refer_spec->Shape();
+  Model::Tensor* refer_spec_raw = speaker_info.m_refer_spec.get();
+  std::unique_ptr<Model::Tensor> refer_spec_view;
+  if (refer_shape.size() == 2) {
+    refer_spec_view = speaker_info.m_refer_spec->View({1, refer_shape[0], refer_shape[1]});
+    refer_spec_raw = refer_spec_view.get();
+  }
+  auto refer_spec_conv = refer_spec_raw->To(sovits_target_device, spec_dtype);
+
+  // sv_emb
+  auto sv_shape = speaker_info.m_sv_emb->Shape();
+  Model::Tensor* sv_emb_raw = speaker_info.m_sv_emb.get();
+  std::unique_ptr<Model::Tensor> sv_emb_view;
+  if (sv_shape.size() == 1) {
+    sv_emb_view = speaker_info.m_sv_emb->View({1, sv_shape[0]});
+    sv_emb_raw = sv_emb_view.get();
+  }
+  auto sv_emb_conv = sv_emb_raw->To(sovits_target_device, sv_dtype);
+
+  // text_seq（target_phones 在整个 segment 中不变）
+  auto text_seq_cpu = Model::Tensor::Empty(
+      {1, static_cast<int64_t>(target_phones.size())},
+      Model::DataType::kInt64,
+      Model::DeviceType::kCPU);
+  std::memcpy(text_seq_cpu->Data<int64_t>(), target_phones.data(),
+              target_phones.size() * sizeof(int64_t));
+  auto text_seq_conv = text_seq_cpu->To(sovits_target_device, text_dtype);
+
   // 生成的语义 tokens 列表
   std::vector<int64_t> generated_tokens;
   std::deque<std::vector<int64_t>> chunk_queue;
@@ -254,7 +298,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   int chunk_index = 0;
   std::vector<float> last_fade_out = prev_fade_out;
 
-  auto decode_and_yield = [&](std::vector<int64_t>& chunk_tokens, 
+  auto decode_and_yield = [&](std::vector<int64_t>& chunk_tokens,
                                const std::vector<int64_t>* lookahead_ptr,
                                bool is_final_chunk) {
     // 获取前瞻tokens（如果有）
@@ -264,10 +308,12 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
       lookahead_tokens.assign(lookahead_ptr->begin(), lookahead_ptr->begin() + l_len);
     }
 
-    // 解码
+    // P1-3: 传入 segment 级别预转换好的特征，DecodeChunk 内不再重复 ->To()
     auto audio_data = DecodeChunk(
         chunk_tokens, history_tokens, lookahead_tokens,
-        speaker_info, target_phones, noise_scale, speed, stats);
+        speaker_info, target_phones,
+        refer_spec_conv.get(), sv_emb_conv.get(), text_seq_conv.get(),
+        noise_scale, speed, stats);
 
     if (audio_data.empty()) {
       return;
@@ -342,10 +388,28 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   int64_t current_token = first_token;
 
   for (int step = 0; step < max_steps; ++step) {
-    // GPT Step
-    bool step_ok = gpt_step_model->StepWithContext(
-        ctx.get(), current_token, step,
-        encoder_output.x_len, encoder_output.y_len);
+    // P0-1: CUDA 设备下走 GPU 采样路径，消除每步 D2H softmax
+    bool step_ok;
+    int64_t next_token;
+    if (use_gpu_sampling && ctx->enable_gpu_sampling) {
+      step_ok = gpt_step_model->StepWithGPUSampling(
+          ctx.get(), current_token, step,
+          encoder_output.x_len, encoder_output.y_len,
+          temperature);
+      if (step_ok) {
+        next_token = gpt_step_model->GetSampledTokenGPU(ctx.get());
+      }
+    } else {
+      step_ok = gpt_step_model->StepWithContext(
+          ctx.get(), current_token, step,
+          encoder_output.x_len, encoder_output.y_len);
+      if (step_ok) {
+        next_token = Utils::SampleTopK(
+            ctx->topk_values.get(),
+            ctx->topk_indices.get(),
+            temperature);
+      }
+    }
 
     if (!step_ok) {
       consecutive_invalid_count++;
@@ -360,12 +424,6 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     }
 
     consecutive_invalid_count = 0;
-
-    // 采样下一个 token
-    int64_t next_token = Utils::SampleTopK(
-        ctx->topk_values.get(),
-        ctx->topk_indices.get(),
-        temperature);
 
     if (next_token < 0 || next_token > 1024) {
       next_token = std::max<int64_t>(0, std::min<int64_t>(next_token, 1024));
@@ -466,6 +524,9 @@ std::vector<float> StreamingPipeline::DecodeChunk(
     const std::vector<int64_t>& lookahead_tokens,
     const SpeakerInfo& speaker_info,
     const std::vector<int64_t>& target_phones,
+    Model::Tensor* refer_spec_preconverted,
+    Model::Tensor* sv_emb_preconverted,
+    Model::Tensor* text_seq_preconverted,
     float noise_scale,
     float speed,
     Model::InferStats* stats) {
@@ -499,81 +560,37 @@ std::vector<float> StreamingPipeline::DecodeChunk(
   PrintDebug("[StreamingPipeline::DecodeChunk] input_tokens={}, h_used={}, chunk={}, l_used={}",
             input_tokens.size(), h_used, chunk_tokens.size(), l_used);
 
-  // 检查 target_phones 是否有效
   if (target_phones.empty()) {
     PrintWarn("[StreamingPipeline::DecodeChunk] target_phones is empty");
     return {};
   }
 
-  // 准备 pred_semantic 张量 (1, 1, seq_len)
-  auto pred_semantic = Model::Tensor::Empty(
-      {1, 1, static_cast<int64_t>(input_tokens.size())},
-      Model::DataType::kInt64,
-      Model::DeviceType::kCPU);
-  int64_t* semantic_ptr = pred_semantic->Data<int64_t>();
-  std::memcpy(semantic_ptr, input_tokens.data(), input_tokens.size() * sizeof(int64_t));
-
-  // 准备 text_seq 张量 (1, phone_len)
-  auto text_seq = Model::Tensor::Empty(
-      {1, static_cast<int64_t>(target_phones.size())},
-      Model::DataType::kInt64,
-      Model::DeviceType::kCPU);
-  int64_t* text_ptr = text_seq->Data<int64_t>();
-  std::memcpy(text_ptr, target_phones.data(), target_phones.size() * sizeof(int64_t));
-
-  // 准备 refer_spec - 添加空指针检查
-  if (!speaker_info.m_refer_spec) {
-    PrintError("[StreamingPipeline::DecodeChunk] speaker_info.m_refer_spec is null");
-    return {};
-  }
-  auto refer_shape = speaker_info.m_refer_spec->Shape();
-  std::unique_ptr<Model::Tensor> refer_spec_view;
-  Model::Tensor* refer_spec_ptr = speaker_info.m_refer_spec.get();
-  if (refer_shape.size() == 2) {
-    refer_spec_view = speaker_info.m_refer_spec->View({1, refer_shape[0], refer_shape[1]});
-    refer_spec_ptr = refer_spec_view.get();
-  }
-
-  // 准备 sv_emb - 添加空指针检查
-  if (!speaker_info.m_sv_emb) {
-    PrintError("[StreamingPipeline::DecodeChunk] speaker_info.m_sv_emb is null");
-    return {};
-  }
-  auto sv_shape = speaker_info.m_sv_emb->Shape();
-  std::unique_ptr<Model::Tensor> sv_emb_view;
-  Model::Tensor* sv_emb_ptr = speaker_info.m_sv_emb.get();
-  if (sv_shape.size() == 1) {
-    sv_emb_view = speaker_info.m_sv_emb->View({1, sv_shape[0]});
-    sv_emb_ptr = sv_emb_view.get();
-  }
-
-  // 检查 sovits_model 是否有效
   if (!sovits_model || !sovits_model->GetModel()) {
     PrintError("[StreamingPipeline::DecodeChunk] sovits_model is null");
     return {};
   }
 
+  // 准备 pred_semantic 张量 (1, 1, seq_len) — 每次 chunk 不同，不可复用
   auto target_device = sovits_model->GetModel()->GetDevice();
   auto pred_dtype = sovits_model->GetModel()->GetInputDataType("pred_semantic");
-  auto text_dtype = sovits_model->GetModel()->GetInputDataType("text_seq");
-  auto spec_dtype = sovits_model->GetModel()->GetInputDataType("refer_spec");
-  auto sv_dtype = sovits_model->GetModel()->GetInputDataType("sv_emb");
 
-  // 类型转换到目标设备
-  PrintDebug("[StreamingPipeline::DecodeChunk] Converting tensors to target device...");
+  auto pred_semantic = Model::Tensor::Empty(
+      {1, 1, static_cast<int64_t>(input_tokens.size())},
+      Model::DataType::kInt64,
+      Model::DeviceType::kCPU);
+  std::memcpy(pred_semantic->Data<int64_t>(), input_tokens.data(),
+              input_tokens.size() * sizeof(int64_t));
   auto pred_semantic_final = pred_semantic->To(target_device, pred_dtype);
-  auto text_seq_final = text_seq->To(target_device, text_dtype);
-  auto refer_spec_final = refer_spec_ptr->To(target_device, spec_dtype);
-  auto sv_emb_final = sv_emb_ptr->To(target_device, sv_dtype);
-  PrintDebug("[StreamingPipeline::DecodeChunk] Tensor conversion done, calling GenerateTensor...");
 
-  // SoVITS 推理
+  // P1-3: refer_spec / sv_emb / text_seq 使用调用方预转换好的张量，无需重复 ->To()
+  PrintDebug("[StreamingPipeline::DecodeChunk] Using pre-converted speaker tensors, calling GenerateTensor...");
+
   auto t_sovits_start = std::chrono::steady_clock::now();
   auto audio_tensor = sovits_model->GenerateTensor(
       pred_semantic_final.get(),
-      text_seq_final.get(),
-      refer_spec_final.get(),
-      sv_emb_final.get(),
+      text_seq_preconverted,
+      refer_spec_preconverted,
+      sv_emb_preconverted,
       noise_scale,
       speed);
   if (stats) {
@@ -608,8 +625,6 @@ std::vector<float> StreamingPipeline::DecodeChunk(
   std::memcpy(result.data(), audio_ptr, audio_size * sizeof(float));
 
   // 裁剪：只取 chunk 对应的部分，去掉 history 和 lookahead 的音频
-  // res = audio.flatten()[h_samples : h_samples + c_samples]
-  // samples_per_token = (sr / 25) / speed，语义帧率 25Hz
   int samples_per_token = static_cast<int>(std::round(
       static_cast<float>(sampling_rate) / 25.0f / speed));
   int h_samples = static_cast<int>(h_used) * samples_per_token;

@@ -38,12 +38,19 @@ struct GPTStepContext {
   std::unique_ptr<Tensor> k_cache[2];  // [num_layers, batch, max_seq_len, head_dim]
   std::unique_ptr<Tensor> v_cache[2];  // [num_layers, batch, max_seq_len, head_dim]
 
+  // 预分配 cache dtype 转换缓冲区
+  std::unique_ptr<Tensor> k_conv_buf;
+  std::unique_ptr<Tensor> v_conv_buf;
+
   // 输出缓冲区 (复用)
   std::unique_ptr<Tensor> topk_values;   // [1, top_k]
   std::unique_ptr<Tensor> topk_indices;  // [1, top_k]
 
-  // 预分配的索引张量 (避免每次创建)
-  std::vector<std::unique_ptr<Tensor>> idx_tensors;  // [max_steps] 个 [1] 张量
+  // 预分配的索引张量
+  // idx_base_tensor: [max_steps] 连续 int64 GPU tensor (0,1,2,...,max_steps-1)
+  // idx_tensors[i]:  Slice 视图 [1]，指向 idx_base_tensor[i]，无独立 cudaMalloc
+  std::unique_ptr<Tensor> idx_base_tensor;
+  std::vector<std::unique_ptr<Tensor>> idx_tensors;
 
   // 预分配的标量输入张量
   std::unique_ptr<Tensor> current_samples;  // [1, 1] on model device
@@ -59,16 +66,16 @@ struct GPTStepContext {
   // 是否需要 cache 类型转换 (input dtype != output dtype)
   bool needs_cache_conversion = false;
 
-  // x_len/y_len 是否已初始化（优化：只在第一次拷贝到 GPU）
+  // x_len/y_len 是否已初始化（只在第一次拷贝到 GPU）
   bool x_y_len_initialized = false;
 
 #ifdef WITH_CUDA
   // GPU RNG state (Philox counter)
   std::unique_ptr<Tensor> rng_state;       // [1] uint64 on GPU
-  
+
   // GPU 采样输出 token
   std::unique_ptr<Tensor> out_token_gpu;   // [1] int64 on GPU
-  
+
   // CUDA stream for async operations
   cudaStream_t cuda_stream = nullptr;
   bool owns_stream = false;
@@ -76,14 +83,17 @@ struct GPTStepContext {
   void* pinned_topk_values = nullptr;
   void* pinned_topk_indices = nullptr;
   int64_t pinned_topk_k = 0;
-  
+
+  // pinned memory staging buffer for async current_token H2D
+  void* pinned_current_token = nullptr;
+
   // CUDA event for synchronization
   cudaEvent_t sync_event = nullptr;
 #endif
-  
+
   // 是否启用 GPU 采样
   bool enable_gpu_sampling = false;
-  
+
   // top_k 值
   int top_k = 5;
 

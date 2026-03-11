@@ -154,6 +154,10 @@ private:
       const std::vector<int64_t>& lookahead_tokens,
       const SpeakerInfo& speaker_info,
       const std::vector<int64_t>& target_phones,
+      // 预转换好的说话人特征
+      Model::Tensor* refer_spec_preconverted,
+      Model::Tensor* sv_emb_preconverted,
+      Model::Tensor* text_seq_preconverted,
       float noise_scale,
       float speed,
       Model::InferStats* stats = nullptr);

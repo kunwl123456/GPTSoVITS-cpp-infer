@@ -203,11 +203,13 @@ std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
     ctx->v_cache[i] = Tensor::Empty(kv_cache_shape, cache_dtype, model_device);
   }
 
-  // 如果 input dtype != output dtype，需要在每步推理前做类型转换
+  // 如果 input dtype != output dtype，预分配转换缓冲区
   ctx->needs_cache_conversion = (m_cache_dtype != m_cache_out_dtype);
   if (ctx->needs_cache_conversion) {
-    PrintInfo("[GPTStepContext] Cache dtype mismatch (in={}, out={}), per-step conversion enabled",
+    PrintInfo("[GPTStepContext] Cache dtype mismatch (in={}, out={}), pre-allocating conversion buffers",
               static_cast<int>(m_cache_dtype), static_cast<int>(m_cache_out_dtype));
+    ctx->k_conv_buf = Tensor::Empty(kv_cache_shape, m_cache_dtype, model_device);
+    ctx->v_conv_buf = Tensor::Empty(kv_cache_shape, m_cache_dtype, model_device);
   }
 
   // 预分配输出缓冲区（dtype 从模型输出元数据获取）
@@ -216,21 +218,28 @@ std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
   ctx->topk_values  = Tensor::Empty({1, top_k}, topk_val_dtype, model_device);
   ctx->topk_indices = Tensor::Empty({1, top_k}, topk_idx_dtype, model_device);
 
-  // 预分配索引张量 (0 到 max_steps-1)
-  PrintInfo("[GPTStepContext] Pre-allocating {} index tensors", max_steps);
-  ctx->idx_tensors.reserve(max_steps);
-  for (int i = 0; i < max_steps; ++i) {
-    // 先在 CPU 上创建并填充数据
-    auto idx_tensor_cpu = Tensor::Empty({1}, DataType::kInt64, Device{DeviceType::kCPU, 0});
-    int64_t* idx_data = static_cast<int64_t*>(idx_tensor_cpu->Data());
-    idx_data[0] = static_cast<int64_t>(i);
+  // 预分配索引张量：单次 cudaMalloc，切片视图引用同一块显存
+  // 1 次 cudaMalloc [max_steps]，再用 Slice 生成零拷贝视图
+  PrintInfo("[GPTStepContext] Pre-allocating idx tensor as single block ({} elements)", max_steps);
+  {
+    // 在 CPU 上填充 0,1,2,...,max_steps-1
+    auto idx_cpu = Tensor::Empty({static_cast<int64_t>(max_steps)},
+                                 DataType::kInt64,
+                                 Device{DeviceType::kCPU, 0});
+    int64_t* p = idx_cpu->Data<int64_t>();
+    for (int i = 0; i < max_steps; ++i) p[i] = static_cast<int64_t>(i);
 
-    // 如果目标设备是 CUDA，则传输到 GPU
+    // 一次性搬到目标设备
     if (model_device.type == DeviceType::kCUDA) {
-      auto idx_tensor = idx_tensor_cpu->To(model_device,DataType::kInt64);
-      ctx->idx_tensors.push_back(std::move(idx_tensor));
+      ctx->idx_base_tensor = idx_cpu->To(model_device, DataType::kInt64);
     } else {
-      ctx->idx_tensors.push_back(std::move(idx_tensor_cpu));
+      ctx->idx_base_tensor = std::move(idx_cpu);
+    }
+
+    // 每个步骤用 Slice 取 [i, i+1) → shape [1]，共享底层显存
+    ctx->idx_tensors.reserve(max_steps);
+    for (int i = 0; i < max_steps; ++i) {
+      ctx->idx_tensors.push_back(ctx->idx_base_tensor->Slice(i, i + 1, 0));
     }
   }
 
@@ -253,10 +262,18 @@ std::unique_ptr<GPTStepContext> GPTStepModel::CreateContext(
   auto ctx = CreateContext(desc.raw_shape, max_steps, top_k);
 
   Device target_device = m_model->GetDevice();
-  ctx->k_cache[0] = const_cast<KVCacheBuffer&>(init_cache).CurrentK()
-                        ->To(target_device, m_cache_out_dtype);
-  ctx->v_cache[0] = const_cast<KVCacheBuffer&>(init_cache).CurrentV()
-                        ->To(target_device, m_cache_out_dtype);
+  Tensor* src_k = const_cast<KVCacheBuffer&>(init_cache).CurrentK();
+  Tensor* src_v = const_cast<KVCacheBuffer&>(init_cache).CurrentV();
+
+  if (src_k->Type() == m_cache_out_dtype && src_k->GetDevice() == target_device) {
+    // 类型和设备匹配：直接 CopyFrom
+    ctx->k_cache[0]->CopyFrom(src_k);
+    ctx->v_cache[0]->CopyFrom(src_v);
+  } else {
+    // 只做一次->To()
+    ctx->k_cache[0] = src_k->To(target_device, m_cache_out_dtype);
+    ctx->v_cache[0] = src_v->To(target_device, m_cache_out_dtype);
+  }
 
   return ctx;
 }
@@ -277,15 +294,21 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
     return false;
   }
 
-  std::unique_ptr<Tensor> k_conv, v_conv;
   Tensor* k_input = ctx->GetCurrentKCache();
   Tensor* v_input = ctx->GetCurrentVCache();
 
   if (ctx->needs_cache_conversion) {
-    k_conv = k_input->To(k_input->GetDevice(), m_cache_dtype);
-    v_conv = v_input->To(v_input->GetDevice(), m_cache_dtype);
-    k_input = k_conv.get();
-    v_input = v_conv.get();
+#ifdef WITH_CUDA
+    cudaStream_t stream = ctx->cuda_stream ? ctx->cuda_stream : 0;
+    GPU::LaunchTypeConversionKernel(
+        k_input->Data(), ctx->k_conv_buf->Data(),
+        k_input->ElementCount(), m_cache_out_dtype, m_cache_dtype, stream);
+    GPU::LaunchTypeConversionKernel(
+        v_input->Data(), ctx->v_conv_buf->Data(),
+        v_input->ElementCount(), m_cache_out_dtype, m_cache_dtype, stream);
+#endif
+    k_input = ctx->k_conv_buf.get();
+    v_input = ctx->v_conv_buf.get();
   }
 
   std::unordered_map<std::string, Tensor*> inputs = {
@@ -318,38 +341,53 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
     return false;
   }
 
-  // Update current_samples tensor with the new token value
   if (ctx->current_samples->IsCPU()) {
+    // CPU 路径：直接写入
     ctx->current_samples->At<int64_t>(0) = current_token;
-  }
-#ifdef WITH_CUDA
-  else {
-    cudaMemcpy(ctx->current_samples->Data(), &current_token,
-               sizeof(int64_t), cudaMemcpyHostToDevice);
-  }
-#endif
 
-  // Update x_len / y_len tensors (constant across steps, but cheap to set)
-  if (ctx->x_len_tensor->IsCPU()) {
-    // dtype may be int32 or int64 — write via int64 then let the tensor handle it
-    if (ctx->x_len_tensor->Type() == DataType::kInt32) {
-      ctx->x_len_tensor->At<int32_t>(0) = static_cast<int32_t>(x_len);
-      ctx->y_len_tensor->At<int32_t>(0) = static_cast<int32_t>(y_len);
-    } else {
-      ctx->x_len_tensor->At<int64_t>(0) = x_len;
-      ctx->y_len_tensor->At<int64_t>(0) = y_len;
+    // x_len/y_len 是常量，只在第一步写入
+    if (!ctx->x_y_len_initialized) {
+      if (ctx->x_len_tensor->Type() == DataType::kInt32) {
+        ctx->x_len_tensor->At<int32_t>(0) = static_cast<int32_t>(x_len);
+        ctx->y_len_tensor->At<int32_t>(0) = static_cast<int32_t>(y_len);
+      } else {
+        ctx->x_len_tensor->At<int64_t>(0) = x_len;
+        ctx->y_len_tensor->At<int64_t>(0) = y_len;
+      }
+      ctx->x_y_len_initialized = true;
     }
   }
 #ifdef WITH_CUDA
   else {
-    if (ctx->x_len_tensor->Type() == DataType::kInt32) {
-      int32_t xl = static_cast<int32_t>(x_len);
-      int32_t yl = static_cast<int32_t>(y_len);
-      cudaMemcpy(ctx->x_len_tensor->Data(), &xl, sizeof(int32_t), cudaMemcpyHostToDevice);
-      cudaMemcpy(ctx->y_len_tensor->Data(), &yl, sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaStream_t stream = ctx->cuda_stream ? ctx->cuda_stream : 0;
+
+    // current_token 通过预分配的 pinned buffer 异步传输，避免栈地址失效
+    if (ctx->pinned_current_token) {
+      *static_cast<int64_t*>(ctx->pinned_current_token) = current_token;
+      cudaMemcpyAsync(ctx->current_samples->Data(), ctx->pinned_current_token,
+                      sizeof(int64_t), cudaMemcpyHostToDevice, stream);
     } else {
-      cudaMemcpy(ctx->x_len_tensor->Data(), &x_len, sizeof(int64_t), cudaMemcpyHostToDevice);
-      cudaMemcpy(ctx->y_len_tensor->Data(), &y_len, sizeof(int64_t), cudaMemcpyHostToDevice);
+      // 无 pinned buffer 则回退同步拷贝
+      cudaMemcpy(ctx->current_samples->Data(), &current_token,
+                 sizeof(int64_t), cudaMemcpyHostToDevice);
+    }
+
+    // x_len/y_len 常量，只在第一步异步拷贝一次
+    if (!ctx->x_y_len_initialized) {
+      if (ctx->x_len_tensor->Type() == DataType::kInt32) {
+        int32_t xl = static_cast<int32_t>(x_len);
+        int32_t yl = static_cast<int32_t>(y_len);
+        cudaMemcpyAsync(ctx->x_len_tensor->Data(), &xl, sizeof(int32_t),
+                        cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(ctx->y_len_tensor->Data(), &yl, sizeof(int32_t),
+                        cudaMemcpyHostToDevice, stream);
+      } else {
+        cudaMemcpyAsync(ctx->x_len_tensor->Data(), &x_len, sizeof(int64_t),
+                        cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(ctx->y_len_tensor->Data(), &y_len, sizeof(int64_t),
+                        cudaMemcpyHostToDevice, stream);
+      }
+      ctx->x_y_len_initialized = true;
     }
   }
 #endif
@@ -512,17 +550,27 @@ bool GPTStepModel::EnableGPUSampling(GPTStepContext* ctx, uint64_t seed) {
     PrintDebug("[GPTStepModel] Created new CUDA stream");
   }
 
+  // P0-2: 分配 pinned memory staging buffer，供 StepWithContext 异步 H2D 使用
+  if (!ctx->pinned_current_token) {
+    cudaError_t err = cudaMallocHost(&ctx->pinned_current_token, sizeof(int64_t));
+    if (err != cudaSuccess) {
+      PrintWarn("[GPTStepModel] Failed to alloc pinned buffer: {}, falling back to sync",
+                cudaGetErrorString(err));
+      ctx->pinned_current_token = nullptr;
+    }
+  }
+
   ctx->rng_state = Tensor::Empty({1}, DataType::kUInt64, model_device);
   uint64_t init_seed = (seed != 0) ? seed : static_cast<uint64_t>(std::random_device{}());
-  cudaMemcpyAsync(ctx->rng_state->Data(), &init_seed, sizeof(uint64_t), 
+  cudaMemcpyAsync(ctx->rng_state->Data(), &init_seed, sizeof(uint64_t),
                   cudaMemcpyHostToDevice, ctx->cuda_stream);
 
   ctx->out_token_gpu = Tensor::Empty({1}, DataType::kInt64, model_device);
 
   ctx->enable_gpu_sampling = true;
   ctx->top_k = static_cast<int>(ctx->topk_values->Shape().back());
-  
-  PrintInfo("[GPTStepModel] GPU sampling enabled (seed={}, top_k={}, own_stream={})", 
+
+  PrintInfo("[GPTStepModel] GPU sampling enabled (seed={}, top_k={}, own_stream={})",
             init_seed, ctx->top_k, ctx->owns_stream);
   return true;
 #else

@@ -26,9 +26,9 @@
 #ifdef _HOST_ANDROID_
 #include <android/log.h>
 
-#define ___PLOG_COUTI__(COUT_CODE) __android_log_print(ANDROID_LOG_INFO, "GPTSovits C++", "%s", fmt::format(COUT_CODE).c_str())
-#define ___PLOG_COUTD__(COUT_CODE) __android_log_print(ANDROID_LOG_DEBUG, "GPTSovits C++", "%s", fmt::format(COUT_CODE).c_str())
-#define ___PLOG_COUTE__(COUT_CODE) __android_log_print(ANDROID_LOG_ERROR, "GPTSovits C++", "%s", fmt::format(COUT_CODE).c_str())
+#define ___PLOG_COUTI__(COUT_CODE) __android_log_print(ANDROID_LOG_INFO, "GPTSovits", "%s", fmt::format(COUT_CODE).c_str())
+#define ___PLOG_COUTD__(COUT_CODE) __android_log_print(ANDROID_LOG_DEBUG, "GPTSovits", "%s", fmt::format(COUT_CODE).c_str())
+#define ___PLOG_COUTE__(COUT_CODE) __android_log_print(ANDROID_LOG_ERROR, "GPTSovits", "%s", fmt::format(COUT_CODE).c_str())
 #else
 #define ___PLOG_COUTI__(COUT_CODE) std::cout << COUT_CODE << std::endl;
 #define ___PLOG_COUTD__(COUT_CODE) std::cout << COUT_CODE << std::endl;
