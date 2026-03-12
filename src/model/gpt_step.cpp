@@ -463,11 +463,37 @@ bool GPTStepModel::StepWithGPUSampling(GPTStepContext* ctx,
       {"v_cache_new",  ctx->GetNextVCache()}
   };
 
+  {
+    Device d = m_model->GetDevice();
+    if (!d.stream || d.stream != static_cast<void*>(ctx->cuda_stream)) {
+      cudaStreamSynchronize(ctx->cuda_stream);
+    }
+  }
+
   // Run inference
   bool success = m_model->ForwardWithPreallocatedOutput(inputs, outputs);
   if (!success) {
     PrintError("[GPTStepModel] Forward failed");
     return false;
+  }
+
+  // After Forward, the TRT backend's stream is now initialized (device_.stream
+  // is set by InferCore on the first call). If it differs from ctx->cuda_stream,
+  // sync it and adopt it so all subsequent ops (H2D + sampling) run on the same
+  // stream as TRT inference — eliminating the race condition permanently.
+  {
+    Device d = m_model->GetDevice();
+    cudaStream_t model_stream = d.stream ?
+        static_cast<cudaStream_t>(d.stream) : nullptr;
+    if (model_stream && model_stream != ctx->cuda_stream) {
+      cudaStreamSynchronize(model_stream);
+      if (ctx->owns_stream && ctx->cuda_stream) {
+        cudaStreamDestroy(ctx->cuda_stream);
+      }
+      ctx->cuda_stream = model_stream;
+      ctx->owns_stream = false;
+      PrintDebug("[GPTStepModel] Adopted model stream, eliminated stream mismatch");
+    }
   }
 
   // GPU 采样 (在同一个 stream 上执行)
