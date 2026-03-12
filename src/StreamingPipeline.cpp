@@ -116,7 +116,7 @@ bool StreamingPipeline::InferSpeakerStreaming(
 
     // 流式处理段落
     prev_fade_out = ProcessSegmentStreaming(
-        *speaker_info, segment, seg_idx, callback,
+        *speaker_info, segment, text_lang, seg_idx, callback,
         sample_config.temperature, noise_scale, speed, prev_fade_out, stats);
 
     // 添加段落间停顿
@@ -147,6 +147,7 @@ bool StreamingPipeline::InferSpeakerStreaming(
 std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     const SpeakerInfo& speaker_info,
     const std::string& segment,
+    const std::string& text_lang,
     int segment_index,
     AudioChunkCallback callback,
     float temperature,
@@ -164,7 +165,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   PrintDebug("[StreamingPipeline::ProcessSegmentStreaming] segment: {}", segment);
 
   // G2P 处理目标文本
-  auto target_bert_res = g2p_pipeline->GetPhoneAndBert(segment, "zh");
+  auto target_bert_res = g2p_pipeline->GetPhoneAndBert(segment, text_lang);
 
   // 获取音素序列
   auto target_phones_tensor = target_bert_res->PhoneSeq;
@@ -366,8 +367,10 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     chunk.chunk_index = chunk_index;
     chunk.duration = static_cast<float>(chunk.audio_data.size()) / sampling_rate;
     
-    // 应用流式响度归一化 (保持各块响度均匀)
-    m_loudness_normalizer.NormalizeStreaming(chunk.audio_data);
+    // 流式响度归一化
+    if (m_config.enable_loudness_normalize) {
+      m_loudness_normalizer.NormalizeStreaming(chunk.audio_data);
+    }
 
     // 调用回调
     if (callback) {
@@ -388,7 +391,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   int64_t current_token = first_token;
 
   for (int step = 0; step < max_steps; ++step) {
-    // P0-1: CUDA 设备下走 GPU 采样路径，消除每步 D2H softmax
+    // CUDA 设备下走 GPU 采样路径
     bool step_ok;
     int64_t next_token;
     if (use_gpu_sampling && ctx->enable_gpu_sampling) {
@@ -418,8 +421,6 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
                    consecutive_invalid_count, step);
         break;
       }
-      token_counter++;
-      generated_tokens.push_back(current_token);
       continue;
     }
 
@@ -442,36 +443,33 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
 
     // mute_matrix
     bool is_split = false;
-    if (token_counter >= m_config.chunk_length + 2) {
-      // 如果启用了 mute_matrix，尝试找到最佳分割点
-      if (m_config.enable_mute_matrix && m_mute_matrix) {
-        // 获取最近的 tokens 用于计算分割点
-        std::vector<int64_t> recent_tokens(
-            generated_tokens.end() - token_counter,
-            generated_tokens.end());
 
-        int split_idx = FindBestSplitPoint(recent_tokens, m_config.chunk_length);
-        if (split_idx >= 0 && split_idx + 1 >= m_config.chunk_length) {
-          // 在最佳分割点分割
-          int actual_split = split_idx + 1;
-          std::vector<int64_t> chunk_tokens(
-              generated_tokens.end() - token_counter,
-              generated_tokens.end() - token_counter + actual_split);
-          chunk_queue.push_back(std::move(chunk_tokens));
-          token_counter -= actual_split;
-          is_split = true;
-        }
-      }
+    if (m_config.enable_mute_matrix && m_mute_matrix && token_counter >= m_config.chunk_length + 2) {
+      // 获取最近的 tokens 用于计算分割点
+      std::vector<int64_t> recent_tokens(
+          generated_tokens.end() - token_counter,
+          generated_tokens.end());
 
-      // 如果没有使用 mute_matrix 分割，使用固定长度分割
-      if (!is_split && token_counter >= m_config.chunk_length) {
+      int split_idx = FindBestSplitPoint(recent_tokens, m_config.chunk_length);
+      if (split_idx >= 0 && split_idx + 1 >= m_config.chunk_length) {
+        // 在最佳分割点分割
+        int actual_split = split_idx + 1;
         std::vector<int64_t> chunk_tokens(
             generated_tokens.end() - token_counter,
-            generated_tokens.end());
+            generated_tokens.end() - token_counter + actual_split);
         chunk_queue.push_back(std::move(chunk_tokens));
-        token_counter = 0;
+        token_counter -= actual_split;
         is_split = true;
       }
+    }
+
+    if (!is_split && token_counter >= m_config.chunk_length) {
+      std::vector<int64_t> chunk_tokens(
+          generated_tokens.end() - token_counter,
+          generated_tokens.end());
+      chunk_queue.push_back(std::move(chunk_tokens));
+      token_counter = 0;
+      is_split = true;
     }
 
     // 如果有多个待解码块，解码第一个
@@ -542,6 +540,23 @@ std::vector<float> StreamingPipeline::DecodeChunk(
   size_t h_used = std::min(history_tokens.size(), static_cast<size_t>(m_config.h_len));
   // 截断 lookahead 到 l_len
   size_t l_used = std::min(lookahead_tokens.size(), static_cast<size_t>(m_config.l_len));
+
+  // 截断输入
+  if (m_config.max_sovits_tokens > 0) {
+    int64_t total = static_cast<int64_t>(h_used + chunk_tokens.size() + l_used);
+    if (total > m_config.max_sovits_tokens) {
+      int64_t excess = total - m_config.max_sovits_tokens;
+      // Reduce history first (least important), then lookahead
+      int64_t h_reduce = std::min(static_cast<int64_t>(h_used), excess);
+      h_used -= static_cast<size_t>(h_reduce);
+      excess -= h_reduce;
+      if (excess > 0) {
+        l_used -= static_cast<size_t>(std::min(static_cast<int64_t>(l_used), excess));
+      }
+      PrintDebug("[StreamingPipeline::DecodeChunk] Clamped to max_sovits_tokens={}: h_used={}, chunk={}, l_used={}",
+                m_config.max_sovits_tokens, h_used, chunk_tokens.size(), l_used);
+    }
+  }
 
   // input_tokens = history[-h_len:] + chunk + lookahead[:l_len]
   std::vector<int64_t> input_tokens;

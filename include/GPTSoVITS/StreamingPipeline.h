@@ -32,7 +32,9 @@ struct StreamingConfig {
   bool enable_fade = true;        // 是否启用淡入淡出
   bool enable_mute_matrix = false; // 是否使用静音矩阵分割（暂未实现）
   float mute_threshold = 0.3f;    // 静音矩阵分割阈值
-  std::string mute_matrix_path;   // 静音矩阵文件路径（可选）
+  std::string mute_matrix_path;   // 静音矩阵文件路径（实验中,暂不开放）
+  int max_sovits_tokens = 250;    // SoVITS pred_semantic 最大 token 数，0=无限制
+  bool enable_loudness_normalize = false;
 };
 
 
@@ -118,6 +120,7 @@ private:
   std::vector<float> ProcessSegmentStreaming(
       const SpeakerInfo& speaker_info,
       const std::string& segment,
+      const std::string& text_lang,
       int segment_index,
       AudioChunkCallback callback,
       float temperature,
