@@ -50,12 +50,12 @@ Goals: **Faster 🏎️**, **Embeddable 🔩**, **Bindable to Everything 🌍**,
 
 **TRT:**
 
-| Metric                       | Python TRT  | **C++ TRT**  | **C++ TRT Stream** |
-|:-----------------------------|:------------|:-------------|:-------------------|
-| **Inference Speed (↑)**      | 291.6 tok/s | 312.18 tok/s | **355.65 tok/s**   |
-| **RTF (↓)**                  | 0.2096      | 0.1378       | **0.1205**         |
-| **First Packet Latency (↓)** | 2.683 s     | 0.5 s        | **0.46 S**         |
-| **VRAM Usage (↓)**           | 3.4 G       | 2.8 G        | **2.3 G**          | 
+| Metric                       | Python TRT  | **C++ TRT**      | **C++ TRT Stream** |
+|:-----------------------------|:------------|:-----------------|:-------------------|
+| **Inference Speed (↑)**      | 291.6 tok/s | **357.66 tok/s** | **355.65 tok/s**   |
+| **RTF (↓)**                  | 0.2096      | **0.1020**       | **0.1205**         |
+| **First Packet Latency (↓)** | 2.683 s     | 0.5 s            | **0.46 S**         |
+| **VRAM Usage (↓)**           | 3.4 G       | 2.8 G            | **2.3 G**          | 
 
 ---
 
