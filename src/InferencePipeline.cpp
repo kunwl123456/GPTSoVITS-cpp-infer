@@ -22,7 +22,9 @@
 #include "GPTSoVITS/Utils/Sampling.h"
 #include "GPTSoVITS/Utils/speaker_serializer.h"
 #include "GPTSoVITS/model/CNBertModel.h"
+#ifdef WITH_ONNX
 #include "GPTSoVITS/model/backend/onnx_backend.h"
+#endif
 #include "GPTSoVITS/model/backend/tensorrt_backend.h"
 #ifdef WITH_CUDA
 #include <cuda_runtime_api.h>
@@ -70,6 +72,13 @@ public:
         model_pool(Model::ModelPool::Instance()),
         speaker_manager(SpeakerManager::Instance()) {
     Initialize();
+  }
+  ~Impl() {
+    if (device_ctx) {
+      device_ctx->Synchronize();
+    }
+    g2p_pipeline.reset();
+    model_pool.UnloadAll();
   }
   void Initialize() {
     // 创建设备上下文
@@ -192,6 +201,12 @@ public:
     auto tokenizer_path   = resources_path / "bert_tokenizer.json";
     // TRT backend 优先找 .engine，再找 .onnx
     bool use_trt = config.backend == Model::BackendType::kTensorRT;
+#ifdef WITH_TENSORRT
+    if (config.backend == Model::BackendType::kAuto &&
+        device_ctx->GetDevice().type == Model::DeviceType::kCUDA) {
+      use_trt = true;
+    }
+#endif
     auto bert_path = (use_trt && std::filesystem::exists(bert_engine_path))
                          ? bert_engine_path
                          : bert_onnx_path;
@@ -202,9 +217,15 @@ public:
         bert_cfg.engine_cache_dir = config.engine_cache_dir;
         bert_model->Init<Model::TensorRTBackend>(
             bert_path.string(), tokenizer_path.string(), bert_cfg);
+#ifdef WITH_ONNX
       } else {
         bert_model->Init<Model::ONNXBackend>(
             bert_onnx_path.string(), tokenizer_path.string(), device_ctx->GetDevice());
+#else
+      } else {
+        PrintError("[InferencePipeline] ONNX backend not compiled in");
+        return;
+#endif
       }
       g2p_pipeline->RegisterLangProcess("zh", std::make_unique<G2P::G2PZH>(),
                                         std::move(bert_model), true);

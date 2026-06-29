@@ -96,6 +96,18 @@ struct TensorRTBackend::Impl {
   int device_id = 0;
 
   ~Impl() {
+    cudaSetDevice(device_id);
+    if (own_stream) {
+      cudaStreamSynchronize(own_stream);
+    }
+    cudaDeviceSynchronize();
+
+    // TensorRT contexts/engines may destroy CUDA modules, events, and internal
+    // streams. Release them before tearing down our CUDA stream and mem pool.
+    context.reset();
+    engine.reset();
+    runtime.reset();
+
     FreeBuffers();
     if (own_stream) { cudaStreamDestroy(own_stream); own_stream = nullptr; }
     if (mem_pool) { cudaMemPoolDestroy(mem_pool); mem_pool = nullptr; }
@@ -443,6 +455,7 @@ bool TensorRTBackend::BuildFromONNX(const std::string& onnx_path,
     PrintError("[TRTBackend] createExecutionContext failed");
     return false;
   }
+  impl_->context->setAuxStreams(nullptr, 0);
 
   CollectIOMetadata();
   PrintInfo("[TRTBackend] Engine built successfully from: {}", native_path);
@@ -478,6 +491,7 @@ bool TensorRTBackend::LoadEngine(const std::string& engine_path) {
     PrintError("[TRTBackend] createExecutionContext failed");
     return false;
   }
+  impl_->context->setAuxStreams(nullptr, 0);
 
   CollectIOMetadata();
   PrintInfo("[TRTBackend] Engine loaded from: {}", engine_path);
@@ -764,17 +778,13 @@ std::unique_ptr<BaseModel> BackendFactory::CreateBackend(BackendType type) {
 
 bool BackendFactory::IsBackendAvailable(BackendType type) {
   switch (type) {
-    case BackendType::kONNX:
 #ifdef WITH_ONNX
+    case BackendType::kONNX:
       return true;
-#else
-      return false;
 #endif
-    case BackendType::kTensorRT:
 #ifdef WITH_TENSORRT
+    case BackendType::kTensorRT:
       return true;
-#else
-      return false;
 #endif
     default:
       return false;
@@ -783,8 +793,12 @@ bool BackendFactory::IsBackendAvailable(BackendType type) {
 
 std::vector<BackendType> BackendFactory::GetAvailableBackends() {
   std::vector<BackendType> v;
+#ifdef WITH_ONNX
   if (IsBackendAvailable(BackendType::kONNX))     v.push_back(BackendType::kONNX);
+#endif
+#ifdef WITH_TENSORRT
   if (IsBackendAvailable(BackendType::kTensorRT)) v.push_back(BackendType::kTensorRT);
+#endif
   return v;
 }
 
@@ -850,18 +864,31 @@ bool TensorRTBackend::InferCore(const std::unordered_map<std::string, Tensor*>&,
                                  const std::unordered_map<std::string, Tensor*>&) { return false; }
 
 std::unique_ptr<BaseModel> BackendFactory::CreateBackend(BackendType type) {
+#ifdef WITH_ONNX
   if (type == BackendType::kONNX) {
     PrintWarn("[BackendFactory] Use ONNXBackend directly in model Init<>");
   } else {
+#endif
     PrintWarn("[BackendFactory] Backend not available");
+#ifdef WITH_ONNX
   }
+#endif
   return nullptr;
 }
 bool BackendFactory::IsBackendAvailable(BackendType type) {
+#ifdef WITH_ONNX
   return type == BackendType::kONNX;
+#else
+  (void)type;
+  return false;
+#endif
 }
 std::vector<BackendType> BackendFactory::GetAvailableBackends() {
+#ifdef WITH_ONNX
   return {BackendType::kONNX};
+#else
+  return {};
+#endif
 }
 
 }  // namespace GPTSoVITS::Model
