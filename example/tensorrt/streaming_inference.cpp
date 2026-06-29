@@ -29,15 +29,15 @@
 #ifdef HOST_WINDOWS
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #else
-auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
+auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #endif
 
 #ifdef HOST_WINDOWS
 #define MODEL_PATH \
-  R"(F:\Engcode\AIAssistant\GPT-SoVITS-Devel\GPT-SoVITS_minimal_inference\onnx_export\firefly_v2_proplus_fp16_trt_ur)"
+  R"(/home/autogame/3rd/GPT-SoVITS_minimal_inference/onnx_export/v2proplus_base_fp16)"
 #else
 #define MODEL_PATH \
-  R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
+  R"(/home/autogame/3rd/GPT-SoVITS_minimal_inference/onnx_export/v2proplus_base_fp16)"
 #endif
 
 static std::string readFile(const std::string& path) {

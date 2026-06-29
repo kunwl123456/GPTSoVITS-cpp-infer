@@ -6,6 +6,7 @@
 // 演示使用 InferencePipeline 创建说话人并导出数据包
 //
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -14,15 +15,15 @@
 
 #ifdef _HOST_WINDOWS_
 #define MODEL_PATH \
-  R"(F:\Engcode\AIAssistant\GPT-SoVITS-Devel\GPT-SoVITS_minimal_inference\onnx_export\firefly_v2_proplus_fp16_trt)"
+  R"(/home/autogame/3rd/GPT-SoVITS_minimal_inference/onnx_export/v2proplus_base_fp16)"
 #else
 #define MODEL_PATH \
-  R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
+  R"(/home/autogame/3rd/GPT-SoVITS_minimal_inference/onnx_export/v2proplus_base_fp16)"
 #endif
 #ifdef _HOST_WINDOWS_
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #else
-auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
+auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #endif
 
 int main(int argc, char* argv[]) {
@@ -63,20 +64,13 @@ int main(int argc, char* argv[]) {
     config.device_type = device.type;
     config.device_id = device.device_id;
     config.resources_path = "./res";  // 资源文件路径
+    config.backend = GPTSoVITS::Model::BackendType::kTensorRT;
+    config.engine_cache_dir = "./trt_cache";
     config.verbose = true;
 
     // 创建 Pipeline
     std::cout << "\n[1/3] 初始化 Pipeline..." << std::endl;
     GPTSoVITS::InferencePipeline pipeline(config);
-
-    auto& pool = pipeline.GetModelPool();
-    for (auto type : GPTSoVITS::Model::GetModelTypesInGroup(GPTSoVITS::Model::ModelGroup::kAll)) {
-      auto* cfg = const_cast<GPTSoVITS::Model::ModelConfig*>(pool.GetConfig(type));
-      if (cfg) {
-        cfg->backend = GPTSoVITS::Model::BackendType::kTensorRT;
-        cfg->engine_cache_dir = "./trt_cache";
-      }
-    }
 
     std::cout << pipeline.GetModelInfo() << std::endl;
 
@@ -87,7 +81,9 @@ int main(int argc, char* argv[]) {
 
     if (!speaker) {
       std::cerr << "错误：创建说话人失败" << std::endl;
-      return 1;
+      std::cout.flush();
+      std::cerr.flush();
+      std::_Exit(1);
     }
 
     std::cout << "  说话人创建成功: " << speaker->Name() << std::endl;
@@ -97,14 +93,25 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[3/3] 导出说话人数据包..." << std::endl;
     if (!pipeline.ExportSpeaker(speaker_name, output_path)) {
       std::cerr << "错误：无法导出说话人数据包" << std::endl;
-      return 1;
+      std::cout.flush();
+      std::cerr.flush();
+      std::_Exit(1);
     }
 
     std::cout << "\n✓ 说话人数据包已导出: " << output_path << std::endl;
+    std::cout.flush();
+    std::cerr.flush();
+
+    // TensorRT 10.16/Myelin can crash while tearing down engines at process
+    // exit. This one-shot example has finished exporting the package, so let
+    // the OS reclaim process resources instead of running the TRT destructors.
+    std::_Exit(0);
 
   } catch (const std::exception& e) {
     std::cerr << "\n✗ 错误: " << e.what() << std::endl;
-    return 1;
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(1);
   }
 
   return 0;

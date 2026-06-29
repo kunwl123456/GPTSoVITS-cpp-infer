@@ -4,6 +4,7 @@
 //
 
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -24,15 +25,15 @@
 #ifdef HOST_WINDOWS
 auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #else
-auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCPU, 0);
+auto device = GPTSoVITS::Model::Device(GPTSoVITS::Model::DeviceType::kCUDA, 0);
 #endif
 
 #ifdef HOST_WINDOWS
 #define MODEL_PATH \
-  R"(F:\Engcode\AIAssistant\GPT-SoVITS-Devel\GPT-SoVITS_minimal_inference\onnx_export\firefly_v2_proplus_fp16_trt_ur)"
+  R"(/home/autogame/3rd/GPT-SoVITS_minimal_inference/onnx_export/v2proplus_base_fp16)"
 #else
 #define MODEL_PATH \
-  R"(/Users/huiyi/code/python/GPT-SoVITS_minimal_inference/onnx_export/firefly_v2_proplus_fp16)"
+  R"(/home/autogame/3rd/GPT-SoVITS_minimal_inference/onnx_export/v2proplus_base_fp16)"
 #endif
 
 static void PrintUsage(const char* prog) {
@@ -163,6 +164,14 @@ int main(int argc, char* argv[]) {
       std::cout << "Performance:            Non-real-time (RTF >= 1.0)\n";
     std::cout << "-------------------------------------\n";
     std::cout << "\n音频已保存到: " << output_path << "\n";
+    std::cout.flush();
+    std::cerr.flush();
+
+    // TensorRT 10.16/Myelin may report CUDA teardown errors while destroying
+    // engines at process exit. This one-shot example has already saved the
+    // audio, so bypass the problematic TRT destructor path and let the OS
+    // reclaim process resources.
+    std::_Exit(0);
 
   } catch (const std::exception& e) {
     std::cerr << "错误: " << e.what() << "\n";
