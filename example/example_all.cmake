@@ -6,8 +6,10 @@ add_executable(gpt_sovits_cpp_test_clean_text ${GPT_SOVITS_CPP_TEST_CLEAN_TEXT_S
 target_link_libraries(gpt_sovits_cpp_test_clean_text PUBLIC gsv_lib)
 
 
-add_executable(gpt_sovits_cpp_test_bert example/model/bert.cpp)
-target_link_libraries(gpt_sovits_cpp_test_bert PUBLIC gsv_lib)
+if (USE_ONNX)
+  add_executable(gpt_sovits_cpp_test_bert example/model/bert.cpp)
+  target_link_libraries(gpt_sovits_cpp_test_bert PUBLIC gsv_lib)
+endif ()
 
 
 if (USE_ONNX)
@@ -47,7 +49,9 @@ endif ()
 
 
 target_copy_res(gpt_sovits_cpp_test_clean_text)
-target_copy_res(gpt_sovits_cpp_test_bert)
+if (USE_ONNX)
+  target_copy_res(gpt_sovits_cpp_test_bert)
+endif ()
 
 if (USE_ONNX)
   target_copy_res(gpt_sovits_cpp_cloud_create_onnx)

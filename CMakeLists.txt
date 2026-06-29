@@ -109,6 +109,10 @@ file(GLOB_RECURSE GPT_SOVITS_CPP_SOURCE
     "src/Utils/*.cpp"
 )
 
+if (NOT USE_ONNX)
+  list(FILTER GPT_SOVITS_CPP_SOURCE EXCLUDE REGEX ".*/backend/onnx_backend\\.cpp$")
+endif ()
+
 # CUDA kernel files
 set(GPT_SOVITS_CUDA_SOURCE "")
 if (ENABLE_CUDA)
@@ -158,12 +162,14 @@ if (ENABLE_CUDA)
     # 启用 CUDA 符号解析
     set_target_properties(gsv_lib PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-    target_compile_options(gsv_lib PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/W3>
-        $<$<COMPILE_LANGUAGE:CXX>:/GR>
-        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
-        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
-        )
+    if (MSVC)
+      target_compile_options(gsv_lib PRIVATE
+          $<$<COMPILE_LANGUAGE:CXX>:/W3>
+          $<$<COMPILE_LANGUAGE:CXX>:/GR>
+          $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+          $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+      )
+    endif()
   endif()
 
 endif ()
