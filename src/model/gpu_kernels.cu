@@ -1,4 +1,4 @@
-﻿
+
 #include "GPTSoVITS/model/gpu_kernels.h"
 
 #include <cuda_fp16.h>
@@ -207,140 +207,88 @@ __device__ __forceinline__ float random_uniform(uint64_t* rng_state) {
   return static_cast<float>(result.z) / static_cast<float>(0xFFFFFFFF);
 }
 
-// FP32 Top-K sampling kernel
-__global__ void SampleTopKFP32Kernel(
-    const float* __restrict__ topk_values,
-    const int64_t* __restrict__ topk_indices,
-    int64_t k,
-    float temperature,
-    int64_t* __restrict__ out_token,
-    uint64_t* __restrict__ rng_state) {
-  
-  extern __shared__ float probs[];
-  
-  int tid = threadIdx.x;
-  
-  // Load and process topk_values
-  float max_val = -INFINITY;
-  
-  // Find max (single block, small k)
-  for (int i = tid; i < k; i += blockDim.x) {
-    float v = topk_values[i];
-    if (temperature != 1.0f) v = v / temperature;
-    probs[i] = v;
-    if (v > max_val) max_val = v;
-  }
-  __syncthreads();
-  
-  // Compute exp(v - max) and sum
-  float sum = 0.0f;
-  for (int i = tid; i < k; i += blockDim.x) {
-    float v = probs[i] - max_val;
-    // Clamp
-    if (v > 50.0f) v = 50.0f;
-    else if (v < -50.0f) v = -50.0f;
-    probs[i] = expf(v);
-    if (!isfinite(probs[i])) probs[i] = 0.0f;
-    sum += probs[i];
-  }
-  __syncthreads();
-  
-  // Sum reduction
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) {
-      probs[tid] += probs[tid + s];
-    }
-    __syncthreads();
-  }
-  sum = probs[0];
-  __syncthreads();
-  
-  // Normalize to get probabilities
-  if (sum > 1e-10f) {
-    for (int i = tid; i < k; i += blockDim.x) {
-      probs[i] /= sum;
-    }
-  }
-  __syncthreads();
-  
-  // Sample using CDF (only thread 0)
-  if (tid == 0) {
-    float r = random_uniform(rng_state);
-    float cdf = 0.0f;
-    int64_t selected_idx = k - 1;  // fallback
-    
-    for (int64_t i = 0; i < k; ++i) {
-      cdf += probs[i];
-      if (r <= cdf) {
-        selected_idx = i;
-        break;
-      }
-    }
-    
-    *out_token = topk_indices[selected_idx];
-  }
+template <typename T>
+__device__ __forceinline__ float load_topk_value(const T* values, int64_t idx);
+
+template <>
+__device__ __forceinline__ float load_topk_value<float>(const float* values, int64_t idx) {
+  return values[idx];
 }
 
-// FP16 Top-K sampling kernel (optimized for FP16 model output)
-__global__ void SampleTopKFP16Kernel(
-    const half* __restrict__ topk_values,
+template <>
+__device__ __forceinline__ float load_topk_value<half>(const half* values, int64_t idx) {
+  return __half2float(values[idx]);
+}
+
+template <typename T>
+__global__ void SampleTopKKernel(
+    const T* __restrict__ topk_values,
     const int64_t* __restrict__ topk_indices,
     int64_t k,
     float temperature,
     int64_t* __restrict__ out_token,
     uint64_t* __restrict__ rng_state) {
-  
-  extern __shared__ float probs[];
-  
+
+  extern __shared__ float shared[];
+  float* probs = shared;                  // [k] candidate probabilities
+  float* reduce = shared + k;             // [blockDim.x] reduction scratch
+
   int tid = threadIdx.x;
-  
-  // Load and process topk_values (convert FP16 to FP32)
-  float max_val = -INFINITY;
-  
-  for (int i = tid; i < k; i += blockDim.x) {
-    float v = __half2float(topk_values[i]);
-    if (temperature != 1.0f) v = v / temperature;
+  float inv_temp = (temperature > 1e-6f) ? (1.0f / temperature) : 1.0f;
+
+  // Block-wide max over all candidates for numerically stable softmax.
+  float local_max = -INFINITY;
+  for (int64_t i = tid; i < k; i += blockDim.x) {
+    float v = load_topk_value<T>(topk_values, i) * inv_temp;
     probs[i] = v;
-    if (v > max_val) max_val = v;
+    local_max = fmaxf(local_max, v);
   }
+  reduce[tid] = local_max;
   __syncthreads();
-  
-  // Compute exp(v - max) and sum
-  float sum = 0.0f;
-  for (int i = tid; i < k; i += blockDim.x) {
-    float v = probs[i] - max_val;
-    if (v > 50.0f) v = 50.0f;
-    else if (v < -50.0f) v = -50.0f;
-    probs[i] = expf(v);
-    if (!isfinite(probs[i])) probs[i] = 0.0f;
-    sum += probs[i];
-  }
-  __syncthreads();
-  
-  // Sum reduction
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) {
-      probs[tid] += probs[tid + s];
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
     }
     __syncthreads();
   }
-  sum = probs[0];
+  float max_val = reduce[0];
   __syncthreads();
-  
-  // Normalize
+
+  // Block-wide sum(exp(logit - max)).
+  float local_sum = 0.0f;
+  for (int64_t i = tid; i < k; i += blockDim.x) {
+    float v = probs[i] - max_val;
+    v = fminf(fmaxf(v, -50.0f), 50.0f);
+    float p = expf(v);
+    probs[i] = isfinite(p) ? p : 0.0f;
+    local_sum += probs[i];
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  float sum = reduce[0];
+  __syncthreads();
+
   if (sum > 1e-10f) {
-    for (int i = tid; i < k; i += blockDim.x) {
+    for (int64_t i = tid; i < k; i += blockDim.x) {
       probs[i] /= sum;
     }
   }
   __syncthreads();
-  
-  // Sample using CDF (only thread 0)
+
+  // K is small; a single thread CDF keeps sampling deterministic and simple.
   if (tid == 0) {
     float r = random_uniform(rng_state);
     float cdf = 0.0f;
     int64_t selected_idx = k - 1;
-    
+
     for (int64_t i = 0; i < k; ++i) {
       cdf += probs[i];
       if (r <= cdf) {
@@ -348,7 +296,7 @@ __global__ void SampleTopKFP16Kernel(
         break;
       }
     }
-    
+
     *out_token = topk_indices[selected_idx];
   }
 }
@@ -486,9 +434,9 @@ cudaError_t LaunchSampleTopKKernel(const void* topk_values,
   if (k > 64) block_size = 128;
   if (k > 128) block_size = 256;
   
-  int shared_mem_size = k * sizeof(float);
+  int shared_mem_size = (static_cast<int>(k) + block_size) * sizeof(float);
 
-  SampleTopKFP32Kernel<<<1, block_size, shared_mem_size, stream>>>(
+  SampleTopKKernel<float><<<1, block_size, shared_mem_size, stream>>>(
       static_cast<const float*>(topk_values),
       topk_indices,
       k,
@@ -514,9 +462,9 @@ cudaError_t LaunchSampleTopKFP16Kernel(const void* topk_values,
   if (k > 64) block_size = 128;
   if (k > 128) block_size = 256;
   
-  int shared_mem_size = k * sizeof(float);
+  int shared_mem_size = (static_cast<int>(k) + block_size) * sizeof(float);
 
-  SampleTopKFP16Kernel<<<1, block_size, shared_mem_size, stream>>>(
+  SampleTopKKernel<half><<<1, block_size, shared_mem_size, stream>>>(
       static_cast<const half*>(topk_values),
       topk_indices,
       k,
