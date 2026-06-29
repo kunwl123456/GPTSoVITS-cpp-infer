@@ -7,6 +7,7 @@
 #ifndef GPT_SOVITS_CPP_UTILS_PRECISION_H
 #define GPT_SOVITS_CPP_UTILS_PRECISION_H
 
+#include <cmath>
 #include <string>
 #include <unordered_map>
 

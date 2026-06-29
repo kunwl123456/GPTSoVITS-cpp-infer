@@ -3,7 +3,7 @@
 //
 #include <GPTSoVITS/G2P/Base.h>
 
-#include "GPTSoVITS/G2P/g2p_zh.h"
+#include "GPTSoVITS/G2P/G2P_Zh.h"
 #include "GPTSoVITS/G2P/SymbolManager.h"
 #include "GPTSoVITS/Utils/exception.h"
 

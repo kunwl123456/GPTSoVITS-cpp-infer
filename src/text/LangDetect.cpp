@@ -1,6 +1,8 @@
 //
 // Created by Huiyicc on 24-12-1.
 //
+#include <cstdio>
+
 #include <CLD2/compact_lang_det.h>
 #include <GPTSoVITS/Text/LangDetect.h>
 #include <GPTSoVITS/Utils/exception.h>

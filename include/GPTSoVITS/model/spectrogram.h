@@ -10,6 +10,7 @@
 #include "GPTSoVITS/model/base.h"
 #include "GPTSoVITS/model/tensor.h"
 #include "GPTSoVITS/model/backend/backend_config.h"
+#include "GPTSoVITS/Utils/exception.h"
 
 namespace GPTSoVITS {
 class AudioTools;
