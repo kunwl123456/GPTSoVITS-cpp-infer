@@ -57,6 +57,21 @@ Goals: **Faster 🏎️**, **Embeddable 🔩**, **Bindable to Everything 🌍**,
 | **First Packet Latency (↓)** | 2.683 s     | 0.5 s            | **0.46 S**         |
 | **VRAM Usage (↓)**           | 3.4 G       | 2.8 G            | **2.3 G**          | 
 
+**RTX 4090 D local benchmark (this branch):**
+
+*Environment: AMD Ryzen 9 9950X 16-Core | RTX 4090 D (24GB) | NVIDIA Driver 575.51.03 | CUDA 12.9 | TensorRT 10.16 | FP16 engines*
+
+*Method: same multilingual ZH/JA/EN mixed test text as above, 3 runs averaged. VRAM is peak per-process memory sampled with `nvidia-smi`. Python TRT uses the system TensorRT Python binding via `PYTHONPATH=/usr/lib/python3.10/dist-packages`. C++ ONNX was not re-measured on this machine because the current C++ build is TensorRT-only (`USE_ONNX=OFF`) and the ONNX Runtime C/C++ SDK headers/libraries are not installed.*
+
+| Metric                       | Python ONNX | Python TRT | **C++ TRT Edge** | **C++ TRT Stream** |
+|:-----------------------------|:------------|:-----------|:-----------------|:-------------------|
+| **Inference Speed (↑)**      | 415.88 tok/s | 838.79 tok/s | **883.45 tok/s** | **931.91 tok/s**   |
+| **RTF (↓)**                  | 0.1457      | 0.2803     | **0.0461**       | 0.0519             |
+| **First Packet Latency (↓)** | 0.966 s     | 4.694 s    | 0.302 s          | **0.194 s**        |
+| **VRAM Usage (↓)**           | 3.98 GiB    | 4.14 GiB   | 2.78 GiB         | **2.25 GiB**       |
+
+Average generated audio duration was 18.04s for Python ONNX, 17.84s for Python TRT, 23.60s for C++ TRT Edge, and 21.60s for C++ TRT Stream. Python TRT first latency includes one cold/lazy-init run at 8.803s; the next two runs were about 2.64s. Different runs may produce slightly different durations because semantic sampling is stochastic.
+
 ---
 
 ## 🏗️ Architecture

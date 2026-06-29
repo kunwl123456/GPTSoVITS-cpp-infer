@@ -1,3 +1,25 @@
 /test/
 .idea
 cmake-build-*
+
+# CMake/build outputs
+/build/
+/out/
+/compile_commands.json
+
+# Runtime caches
+/trt_cache/
+
+# Local TensorRT SDK links/copies
+/third_party/tensorrt/include
+/third_party/tensorrt/lib
+
+# Generated inference/speaker artifacts
+/output*.wav
+/benchmark*.wav
+/*.gsppkg
+
+# Crash dumps and logs
+/core
+/core.*
+/*.log
