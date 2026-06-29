@@ -16,12 +16,8 @@ namespace GPTSoVITS::Model {
  * @brief 推理后端类型
  */
 enum class BackendType {
-#ifdef WITH_ONNX
   kONNX = 1,  // ONNX Runtime
-#endif
-#ifdef WITH_TENSORRT
   kTensorRT = 2,  // TensorRT
-#endif
   kAuto = 3,  // 自动选择：CUDA 设备优先 TRT，否则 ONNX
 };
 

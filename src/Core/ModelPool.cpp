@@ -9,7 +9,9 @@
 
 #include "GPTSoVITS/GPTSoVITSCpp.h"
 #include "GPTSoVITS/model/CNBertModel.h"
+#ifdef WITH_ONNX
 #include "GPTSoVITS/model/backend/onnx_backend.h"
+#endif
 #include "GPTSoVITS/model/backend/tensorrt_backend.h"
 #include "GPTSoVITS/model/gpt_encoder.h"
 #include "GPTSoVITS/model/gpt_step.h"
@@ -102,9 +104,24 @@ static BackendType ResolveBackend(const ModelConfig& config) {
 #ifdef WITH_TENSORRT
     if (config.device.type == DeviceType::kCUDA) return BackendType::kTensorRT;
 #endif
+#ifdef WITH_ONNX
     return BackendType::kONNX;
+#elif defined(WITH_TENSORRT)
+    return BackendType::kTensorRT;
+#else
+    return BackendType::kAuto;
+#endif
   }
   return config.backend;
+}
+
+static const char* BackendToString(BackendType backend) {
+  switch (backend) {
+    case BackendType::kTensorRT: return "TensorRT";
+    case BackendType::kONNX:     return "ONNX";
+    case BackendType::kAuto:     return "Auto";
+    default:                     return "Unknown";
+  }
 }
 
 // ============ ModelPool 实现 ============
@@ -192,7 +209,7 @@ std::shared_ptr<void> ModelPool::CreateModel(ModelType type) {
 
   PrintInfo("[ModelPool] Creating model: {} | backend: {} | device: {} | precision: {}",
             ModelTypeToString(type),
-            backend == BackendType::kTensorRT ? "TensorRT" : "ONNX",
+            BackendToString(backend),
             config.device.type == DeviceType::kCUDA ? "CUDA" : "CPU",
             PrecisionModeToString(backend_cfg.precision));
 
@@ -203,64 +220,120 @@ std::shared_ptr<void> ModelPool::CreateModel(ModelType type) {
         auto tok = (GetGlobalResourcesPath() / "bert_tokenizer.json").string();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, tok, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, tok, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       case ModelType::kSSL: {
         auto model = std::make_shared<SSLModel>();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       case ModelType::kVQ: {
         auto model = std::make_shared<VQModel>();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       case ModelType::kSpectrogram: {
         auto model = std::make_shared<SpectrogramModel>();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       case ModelType::kSVEmbedding: {
         auto model = std::make_shared<SVEmbeddingModel>();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       case ModelType::kGPTEncoder: {
         auto model = std::make_shared<GPTEncoderModel>();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       case ModelType::kGPTStep: {
         auto model = std::make_shared<GPTStepModel>();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       case ModelType::kSoVITS: {
         auto model = std::make_shared<SoVITSModel>();
         if (backend == BackendType::kTensorRT)
           model->Init<TensorRTBackend>(config.path, backend_cfg);
+#ifdef WITH_ONNX
         else
           model->Init<ONNXBackend>(config.path, config.device, config.thread_num);
+#else
+        else {
+          PrintError("[ModelPool] ONNX backend not compiled in");
+          return nullptr;
+        }
+#endif
         return model;
       }
       default:
