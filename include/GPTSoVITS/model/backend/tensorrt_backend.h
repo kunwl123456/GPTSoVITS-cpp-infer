@@ -64,6 +64,8 @@ struct TensorRTConfig {
  */
 class TensorRTBackend : public BaseModel {
 public:
+  struct ExecutionLease;
+
   TensorRTBackend();
   ~TensorRTBackend() override;
 
@@ -82,6 +84,17 @@ public:
   bool ForwardWithPreallocatedOutput(
       const std::unordered_map<std::string, Tensor*>& inputs,
       std::unordered_map<std::string, Tensor*>& outputs) override;
+  std::unique_ptr<InferenceLease> AcquireInferenceLease() override;
+  void ForwardWithLease(
+      InferenceLease* lease,
+      const std::unordered_map<std::string, Tensor*>& inputs,
+      std::unordered_map<std::string, std::unique_ptr<Tensor>>& outputs) override;
+  bool ForwardWithPreallocatedOutputWithLease(
+      InferenceLease* lease,
+      const std::unordered_map<std::string, Tensor*>& inputs,
+      std::unordered_map<std::string, Tensor*>& outputs) override;
+  void SynchronizeLease(InferenceLease* lease) override;
+  void* GetLeaseStream(InferenceLease* lease) const override;
 
   const std::vector<std::string>& GetInputNames() const override;
   const std::vector<std::string>& GetOutputNames() const override;

@@ -53,9 +53,6 @@ bool StreamingPipeline::InferSpeakerStreaming(
   PrintInfo("[StreamingPipeline] Starting streaming inference for speaker: {}, text: {}",
             speaker_name, text);
 
-  // 重置流式响度归一化器
-  m_loudness_normalizer.Reset();
-
   // 获取说话人信息
   const SpeakerInfo* speaker_info = m_edge_pipeline->GetSpeakerInfo(speaker_name);
   if (!speaker_info) {
@@ -104,6 +101,21 @@ bool StreamingPipeline::InferSpeakerStreaming(
   }
   segments = std::move(merged_segments);
 
+  TtsWorkflowSlot workflow_slot;
+  workflow_slot.loudness_normalizer.Reset();
+  if (auto gpt_encoder_model = m_edge_pipeline->GetGPTEncoderModel()) {
+    workflow_slot.gpt_encoder_lease =
+        gpt_encoder_model->GetModel()->AcquireInferenceLease();
+  }
+  if (auto gpt_step_model = m_edge_pipeline->GetGPTStepModel()) {
+    workflow_slot.gpt_step_lease =
+        gpt_step_model->GetModel()->AcquireInferenceLease();
+  }
+  if (auto sovits_model = m_edge_pipeline->GetSoVITSModel()) {
+    workflow_slot.sovits_lease =
+        sovits_model->GetModel()->AcquireInferenceLease();
+  }
+
   std::vector<float> prev_fade_out;
   int sampling_rate = m_edge_pipeline->GetSamplingRate();
 
@@ -116,7 +128,7 @@ bool StreamingPipeline::InferSpeakerStreaming(
 
     // 流式处理段落
     prev_fade_out = ProcessSegmentStreaming(
-        *speaker_info, segment, text_lang, seg_idx, callback,
+        workflow_slot, *speaker_info, segment, text_lang, seg_idx, callback,
         sample_config.temperature, noise_scale, speed, prev_fade_out, stats);
 
     // 添加段落间停顿
@@ -145,6 +157,7 @@ bool StreamingPipeline::InferSpeakerStreaming(
 }
 
 std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
+    TtsWorkflowSlot& workflow_slot,
     const SpeakerInfo& speaker_info,
     const std::string& segment,
     const std::string& text_lang,
@@ -207,7 +220,8 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   auto encoder_output = gpt_encoder_model->Encode(
       phoneme_ids_expanded.get(),
       prompts_final.get(),
-      all_bert_expanded.get());
+      all_bert_expanded.get(),
+      workflow_slot.gpt_encoder_lease.get());
 
   // 检查 encoder 输出有效性
   if (!encoder_output.topk_values || !encoder_output.topk_indices) {
@@ -243,7 +257,8 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
   // P0-1: CUDA 设备下启用 GPU 采样，将 softmax+采样移到 GPU，消除每步 D2H 同步
   const bool use_gpu_sampling = (target_device.type == Model::DeviceType::kCUDA);
   if (use_gpu_sampling) {
-    if (!gpt_step_model->EnableGPUSampling(ctx.get())) {
+    if (!gpt_step_model->EnableGPUSampling(
+            ctx.get(), 0, workflow_slot.gpt_step_lease.get())) {
       PrintWarn("[StreamingPipeline] Failed to enable GPU sampling, falling back to CPU");
     }
   }
@@ -311,7 +326,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
 
     // P1-3: 传入 segment 级别预转换好的特征，DecodeChunk 内不再重复 ->To()
     auto audio_data = DecodeChunk(
-        chunk_tokens, history_tokens, lookahead_tokens,
+        workflow_slot, chunk_tokens, history_tokens, lookahead_tokens,
         speaker_info, target_phones,
         refer_spec_conv.get(), sv_emb_conv.get(), text_seq_conv.get(),
         noise_scale, speed, stats);
@@ -369,7 +384,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
     
     // 流式响度归一化
     if (m_config.enable_loudness_normalize) {
-      m_loudness_normalizer.NormalizeStreaming(chunk.audio_data);
+      workflow_slot.loudness_normalizer.NormalizeStreaming(chunk.audio_data);
     }
 
     // 调用回调
@@ -398,14 +413,15 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
       step_ok = gpt_step_model->StepWithGPUSampling(
           ctx.get(), current_token, step,
           encoder_output.x_len, encoder_output.y_len,
-          temperature);
+          temperature, workflow_slot.gpt_step_lease.get());
       if (step_ok) {
         next_token = gpt_step_model->GetSampledTokenGPU(ctx.get());
       }
     } else {
       step_ok = gpt_step_model->StepWithContext(
           ctx.get(), current_token, step,
-          encoder_output.x_len, encoder_output.y_len);
+          encoder_output.x_len, encoder_output.y_len,
+          workflow_slot.gpt_step_lease.get());
       if (step_ok) {
         next_token = Utils::SampleTopK(
             ctx->topk_values.get(),
@@ -517,6 +533,7 @@ std::vector<float> StreamingPipeline::ProcessSegmentStreaming(
 }
 
 std::vector<float> StreamingPipeline::DecodeChunk(
+    TtsWorkflowSlot& workflow_slot,
     const std::vector<int64_t>& chunk_tokens,
     const std::vector<int64_t>& history_tokens,
     const std::vector<int64_t>& lookahead_tokens,
@@ -607,7 +624,8 @@ std::vector<float> StreamingPipeline::DecodeChunk(
       refer_spec_preconverted,
       sv_emb_preconverted,
       noise_scale,
-      speed);
+      speed,
+      workflow_slot.sovits_lease.get());
   if (stats) {
     stats->sovits_time_s += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_sovits_start).count();

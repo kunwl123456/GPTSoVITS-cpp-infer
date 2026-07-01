@@ -263,7 +263,8 @@ public:
                        Tensor* samples,
                        int step_idx,
                        Tensor* x_len,
-                       Tensor* y_len);
+                       Tensor* y_len,
+                       BaseModel::InferenceLease* lease = nullptr);
 
   /**
    * @brief Scalar overload — no Tensor* plumbing in the pipeline.
@@ -281,7 +282,8 @@ public:
                        int64_t current_token,
                        int step_idx,
                        int64_t x_len,
-                       int64_t y_len);
+                       int64_t y_len,
+                       BaseModel::InferenceLease* lease = nullptr);
 
   /**
    * @brief 带GPU采样的Step (零CPU同步)
@@ -302,7 +304,8 @@ public:
                            int step_idx,
                            int64_t x_len,
                            int64_t y_len,
-                           float temperature);
+                           float temperature,
+                           BaseModel::InferenceLease* lease = nullptr);
 
   /**
    * @brief 从GPU获取采样的token (仅当使用GPU采样时)
@@ -319,7 +322,9 @@ public:
    * @param seed RNG种子
    * @return true 如果成功启用
    */
-  bool EnableGPUSampling(GPTStepContext* ctx, uint64_t seed = 0);
+  bool EnableGPUSampling(GPTStepContext* ctx,
+                         uint64_t seed = 0,
+                         BaseModel::InferenceLease* lease = nullptr);
 
   /**
    * @brief Check if IO binding is supported
@@ -339,6 +344,7 @@ public:
   /**
    * @brief Get the underlying model
    */
+  [[nodiscard]] BaseModel* GetModel() { return m_model.get(); }
   [[nodiscard]] const BaseModel* GetModel() const { return m_model.get(); }
 
 private:

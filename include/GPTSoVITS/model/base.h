@@ -5,6 +5,7 @@
 #ifndef GPT_SOVITS_CPP_MODEL_BASE_H
 #define GPT_SOVITS_CPP_MODEL_BASE_H
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,11 @@ namespace GPTSoVITS::Model {
  */
 class BaseModel {
 public:
+  class InferenceLease {
+  public:
+    virtual ~InferenceLease() = default;
+  };
+
   virtual ~BaseModel() = default;
 
   /**
@@ -67,6 +73,48 @@ public:
   virtual bool ForwardWithPreallocatedOutput(
       const std::unordered_map<std::string, Tensor*>& inputs,
       std::unordered_map<std::string, Tensor*>& outputs) = 0;
+
+  /**
+   * @brief Acquire a backend-specific execution lease for request-affinity.
+   *
+   * Backends that do not need explicit execution slots can return nullptr.
+   */
+  virtual std::unique_ptr<InferenceLease> AcquireInferenceLease() { return nullptr; }
+
+  /**
+   * @brief Inference using a previously acquired execution lease.
+   */
+  virtual void ForwardWithLease(
+      InferenceLease* lease,
+      const std::unordered_map<std::string, Tensor*>& inputs,
+      std::unordered_map<std::string, std::unique_ptr<Tensor>>& outputs) {
+    (void)lease;
+    Forward(inputs, outputs);
+  }
+
+  /**
+   * @brief Pre-allocated inference using a previously acquired execution lease.
+   */
+  virtual bool ForwardWithPreallocatedOutputWithLease(
+      InferenceLease* lease,
+      const std::unordered_map<std::string, Tensor*>& inputs,
+      std::unordered_map<std::string, Tensor*>& outputs) {
+    (void)lease;
+    return ForwardWithPreallocatedOutput(inputs, outputs);
+  }
+
+  /**
+   * @brief Synchronize work submitted through a lease.
+   */
+  virtual void SynchronizeLease(InferenceLease* lease) { (void)lease; }
+
+  /**
+   * @brief Return the backend stream owned by a lease, or nullptr.
+   */
+  virtual void* GetLeaseStream(InferenceLease* lease) const {
+    (void)lease;
+    return nullptr;
+  }
 
   /**
    * @brief Get input names

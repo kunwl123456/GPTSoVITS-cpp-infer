@@ -354,6 +354,29 @@ struct TensorRTBackend::Impl {
   }
 };
 
+struct TensorRTBackend::ExecutionLease : public BaseModel::InferenceLease {
+  explicit ExecutionLease(Impl::SlotLease&& lease_)
+      : lease(std::make_unique<Impl::SlotLease>(std::move(lease_))) {}
+
+  ContextSlot& Slot() { return lease->get(); }
+  const ContextSlot& Slot() const { return lease->get(); }
+
+  std::unique_ptr<Impl::SlotLease> lease;
+};
+
+namespace {
+TensorRTBackend::ExecutionLease* AsTRTLease(BaseModel::InferenceLease* lease) {
+  if (!lease) {
+    THROW_ERROR("[TRTBackend] Inference lease is null");
+  }
+  auto* trt_lease = dynamic_cast<TensorRTBackend::ExecutionLease*>(lease);
+  if (!trt_lease) {
+    THROW_ERROR("[TRTBackend] Inference lease belongs to a different backend");
+  }
+  return trt_lease;
+}
+}  // namespace
+
 // ============ 每个模型的 optimization profile 参数 ============
 
 struct ProfileDef {
@@ -904,6 +927,108 @@ bool TensorRTBackend::ForwardWithPreallocatedOutput(
   }
 }
 
+std::unique_ptr<BaseModel::InferenceLease> TensorRTBackend::AcquireInferenceLease() {
+  try {
+    return std::make_unique<ExecutionLease>(impl_->BorrowSlot());
+  } catch (const std::exception& e) {
+    PrintError("[TRTBackend] AcquireInferenceLease failed: {}", e.what());
+    return nullptr;
+  }
+}
+
+void TensorRTBackend::ForwardWithLease(
+    InferenceLease* lease,
+    const std::unordered_map<std::string, Tensor*>& inputs,
+    std::unordered_map<std::string, std::unique_ptr<Tensor>>& outputs) {
+  if (!lease) {
+    Forward(inputs, outputs);
+    return;
+  }
+
+  auto* trt_lease = AsTRTLease(lease);
+  auto& slot = trt_lease->Slot();
+  auto* ctx = slot.context.get();
+
+  std::vector<std::string> out_names;
+  if (outputs.empty()) {
+    out_names = impl_->output_names;
+  } else {
+    for (const auto& [name, _] : outputs) out_names.push_back(name);
+  }
+
+  for (const auto& [name, tensor] : inputs) {
+    nvinfer1::Dims dims;
+    dims.nbDims = static_cast<int>(tensor->Shape().size());
+    for (int i = 0; i < dims.nbDims; ++i)
+      dims.d[i] = static_cast<int32_t>(tensor->Shape()[i]);
+    ctx->setInputShape(name.c_str(), dims);
+  }
+
+  std::unordered_map<std::string, Tensor*> out_ptrs;
+  std::unordered_map<std::string, std::unique_ptr<Tensor>> tmp_tensors;
+
+  for (const auto& name : out_names) {
+    nvinfer1::Dims dims = ctx->getTensorShape(name.c_str());
+    if (dims.nbDims <= 0)
+      THROW_ERRORN("[TRTBackend] getTensorShape failed for output '{}' (nbDims={}), "
+                   "check that all input shapes were set correctly", name, dims.nbDims);
+    for (int i = 0; i < dims.nbDims; ++i) {
+      if (dims.d[i] < 0)
+        THROW_ERRORN("[TRTBackend] output '{}' has dynamic dim[{}]=-1 after shape inference, "
+                     "input shapes may be incomplete", name, i);
+    }
+    std::vector<int64_t> shape(dims.d, dims.d + dims.nbDims);
+    DataType dt = impl_->output_types.at(name);
+    auto t = Tensor::Empty(shape, dt, Device(DeviceType::kCUDA, impl_->device_id));
+    out_ptrs[name] = t.get();
+    tmp_tensors[name] = std::move(t);
+  }
+
+  if (!InferCore(slot, inputs, out_ptrs)) {
+    THROW_ERROR("[TRTBackend] ForwardWithLease failed");
+  }
+
+  for (const auto& name : out_names) {
+    auto& gpu_t = tmp_tensors[name];
+    auto cpu_t = gpu_t->ToDevice(Device(DeviceType::kCPU));
+    outputs[name] = std::move(cpu_t);
+  }
+}
+
+bool TensorRTBackend::ForwardWithPreallocatedOutputWithLease(
+    InferenceLease* lease,
+    const std::unordered_map<std::string, Tensor*>& inputs,
+    std::unordered_map<std::string, Tensor*>& outputs) {
+  if (!lease) {
+    return ForwardWithPreallocatedOutput(inputs, outputs);
+  }
+
+  try {
+    auto* trt_lease = AsTRTLease(lease);
+    return InferCore(trt_lease->Slot(), inputs, outputs);
+  } catch (const std::exception& e) {
+    PrintError("[TRTBackend] ForwardWithPreallocatedOutputWithLease failed: {}", e.what());
+    return false;
+  }
+}
+
+void TensorRTBackend::SynchronizeLease(InferenceLease* lease) {
+  if (!lease) {
+    Synchronize();
+    return;
+  }
+  auto* trt_lease = AsTRTLease(lease);
+  cudaStreamSynchronize(trt_lease->Slot().stream);
+}
+
+void* TensorRTBackend::GetLeaseStream(InferenceLease* lease) const {
+  if (!lease) {
+    return nullptr;
+  }
+  auto* trt_lease = AsTRTLease(lease);
+  return static_cast<void*>(trt_lease->Slot().stream);
+}
+
 // ============ Getters ============
 
 const std::vector<std::string>& TensorRTBackend::GetInputNames() const {
@@ -989,6 +1114,7 @@ std::vector<BackendType> BackendFactory::GetAvailableBackends() {
 namespace GPTSoVITS::Model {
 
 struct TensorRTBackend::ContextSlot {};
+struct TensorRTBackend::ExecutionLease : public BaseModel::InferenceLease {};
 struct TensorRTBackend::Impl {};  // 空 Impl，满足 unique_ptr 析构
 
 TensorRTBackend::TensorRTBackend()  : impl_(std::make_unique<Impl>()) {}
@@ -1020,6 +1146,25 @@ bool TensorRTBackend::ForwardWithPreallocatedOutput(
   PrintError("[TRTBackend] Not compiled with TensorRT support");
   return false;
 }
+std::unique_ptr<BaseModel::InferenceLease> TensorRTBackend::AcquireInferenceLease() {
+  PrintError("[TRTBackend] Not compiled with TensorRT support");
+  return nullptr;
+}
+void TensorRTBackend::ForwardWithLease(
+    InferenceLease*,
+    const std::unordered_map<std::string, Tensor*>&,
+    std::unordered_map<std::string, std::unique_ptr<Tensor>>&) {
+  THROW_ERROR("[TRTBackend] Not compiled with TensorRT support");
+}
+bool TensorRTBackend::ForwardWithPreallocatedOutputWithLease(
+    InferenceLease*,
+    const std::unordered_map<std::string, Tensor*>&,
+    std::unordered_map<std::string, Tensor*>&) {
+  PrintError("[TRTBackend] Not compiled with TensorRT support");
+  return false;
+}
+void TensorRTBackend::SynchronizeLease(InferenceLease*) {}
+void* TensorRTBackend::GetLeaseStream(InferenceLease*) const { return nullptr; }
 const std::vector<std::string>& TensorRTBackend::GetInputNames() const {
   static std::vector<std::string> empty;
   return empty;

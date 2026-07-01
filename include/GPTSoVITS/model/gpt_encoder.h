@@ -91,7 +91,8 @@ public:
   GPTEncoderOutput Encode(
       Tensor* phoneme_ids,
       Tensor* prompts,
-      Tensor* bert_feature);
+      Tensor* bert_feature,
+      BaseModel::InferenceLease* lease = nullptr);
 
   /**
    * @brief Get the number of transformer layers
@@ -118,6 +119,7 @@ public:
   /**
    * @brief Get the underlying model
    */
+  [[nodiscard]] BaseModel* GetModel() { return m_model.get(); }
   [[nodiscard]] const BaseModel* GetModel() const { return m_model.get(); }
 };
 

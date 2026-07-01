@@ -10,6 +10,7 @@
 #include "GPTSoVITS/AudioTools.h"
 #include "GPTSoVITS/EdgePipeline.h"
 #include "GPTSoVITS/Utils/LoudnessNormalizer.h"
+#include "GPTSoVITS/model/base.h"
 #include "GPTSoVITS/model/tensor.h"
 
 namespace GPTSoVITS {
@@ -110,7 +111,13 @@ private:
   std::shared_ptr<EdgePipeline> m_edge_pipeline;
   StreamingConfig m_config;
   std::unique_ptr<Model::Tensor> m_mute_matrix;  // 静音矩阵 (1025,)
-  LoudnessNormalizer m_loudness_normalizer;      // 流式响度归一化器
+
+  struct TtsWorkflowSlot {
+    std::unique_ptr<Model::BaseModel::InferenceLease> gpt_encoder_lease;
+    std::unique_ptr<Model::BaseModel::InferenceLease> gpt_step_lease;
+    std::unique_ptr<Model::BaseModel::InferenceLease> sovits_lease;
+    LoudnessNormalizer loudness_normalizer;
+  };
 
   /**
    * @brief 流式处理单个文本段落
@@ -118,6 +125,7 @@ private:
    * 边生成边解码
    */
   std::vector<float> ProcessSegmentStreaming(
+      TtsWorkflowSlot& workflow_slot,
       const SpeakerInfo& speaker_info,
       const std::string& segment,
       const std::string& text_lang,
@@ -152,6 +160,7 @@ private:
    * @return 解码后的音频数据
    */
   std::vector<float> DecodeChunk(
+      TtsWorkflowSlot& workflow_slot,
       const std::vector<int64_t>& chunk_tokens,
       const std::vector<int64_t>& history_tokens,
       const std::vector<int64_t>& lookahead_tokens,

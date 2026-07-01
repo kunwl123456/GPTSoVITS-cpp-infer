@@ -15,6 +15,35 @@
 
 namespace GPTSoVITS::Model {
 
+#ifdef WITH_CUDA
+namespace {
+void AdoptLeaseStream(GPTStepContext* ctx,
+                      BaseModel* model,
+                      BaseModel::InferenceLease* lease) {
+  if (!ctx || !model || !lease) {
+    return;
+  }
+
+  auto* lease_stream_ptr = model->GetLeaseStream(lease);
+  if (!lease_stream_ptr) {
+    return;
+  }
+
+  auto lease_stream = static_cast<cudaStream_t>(lease_stream_ptr);
+  if (ctx->cuda_stream == lease_stream) {
+    return;
+  }
+
+  if (ctx->owns_stream && ctx->cuda_stream) {
+    cudaStreamSynchronize(ctx->cuda_stream);
+    cudaStreamDestroy(ctx->cuda_stream);
+  }
+  ctx->cuda_stream = lease_stream;
+  ctx->owns_stream = false;
+}
+}  // namespace
+#endif
+
 GPTStepOutput GPTStepModel::Step(Tensor* samples,
                                  Tensor* k_cache,
                                  Tensor* v_cache,
@@ -282,7 +311,8 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
                                    Tensor* samples,
                                    int step_idx,
                                    Tensor* x_len,
-                                   Tensor* y_len) {
+                                   Tensor* y_len,
+                                   BaseModel::InferenceLease* lease) {
 
   if (!ctx) {
     PrintError("[GPTStepModel] Context is null");
@@ -293,6 +323,10 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
     PrintError("[GPTStepModel] step_idx {} out of range [0, {})", step_idx, ctx->max_steps);
     return false;
   }
+
+#ifdef WITH_CUDA
+  AdoptLeaseStream(ctx, m_model.get(), lease);
+#endif
 
   Tensor* k_input = ctx->GetCurrentKCache();
   Tensor* v_input = ctx->GetCurrentVCache();
@@ -326,7 +360,8 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
       {"v_cache_new",  ctx->GetNextVCache()}
   };
 
-  bool success = m_model->ForwardWithPreallocatedOutput(inputs, outputs);
+  bool success =
+      m_model->ForwardWithPreallocatedOutputWithLease(lease, inputs, outputs);
   if (success) ctx->SwapBuffers();
   return success;
 }
@@ -335,11 +370,16 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
                                    int64_t current_token,
                                    int step_idx,
                                    int64_t x_len,
-                                   int64_t y_len) {
+                                   int64_t y_len,
+                                   BaseModel::InferenceLease* lease) {
   if (!ctx) {
     PrintError("[GPTStepModel] Context is null (scalar overload)");
     return false;
   }
+
+#ifdef WITH_CUDA
+  AdoptLeaseStream(ctx, m_model.get(), lease);
+#endif
 
   if (ctx->current_samples->IsCPU()) {
     // CPU 路径：直接写入
@@ -393,7 +433,8 @@ bool GPTStepModel::StepWithContext(GPTStepContext* ctx,
 #endif
 
   return StepWithContext(ctx, ctx->current_samples.get(), step_idx,
-                         ctx->x_len_tensor.get(), ctx->y_len_tensor.get());
+                         ctx->x_len_tensor.get(), ctx->y_len_tensor.get(),
+                         lease);
 }
 
 bool GPTStepModel::StepWithGPUSampling(GPTStepContext* ctx,
@@ -401,7 +442,8 @@ bool GPTStepModel::StepWithGPUSampling(GPTStepContext* ctx,
                                        int step_idx,
                                        int64_t x_len,
                                        int64_t y_len,
-                                       float temperature) {
+                                       float temperature,
+                                       BaseModel::InferenceLease* lease) {
 #ifdef WITH_CUDA
   if (!ctx || !ctx->enable_gpu_sampling) {
     PrintError("[GPTStepModel] GPU sampling not enabled or ctx is null");
@@ -412,6 +454,8 @@ bool GPTStepModel::StepWithGPUSampling(GPTStepContext* ctx,
     PrintError("[GPTStepModel] step_idx {} out of range [0, {})", step_idx, ctx->max_steps);
     return false;
   }
+
+  AdoptLeaseStream(ctx, m_model.get(), lease);
 
   // Update current_samples (GPU tensor)
   cudaMemcpyAsync(ctx->current_samples->Data(), &current_token,
@@ -471,7 +515,8 @@ bool GPTStepModel::StepWithGPUSampling(GPTStepContext* ctx,
   }
 
   // Run inference
-  bool success = m_model->ForwardWithPreallocatedOutput(inputs, outputs);
+  bool success =
+      m_model->ForwardWithPreallocatedOutputWithLease(lease, inputs, outputs);
   if (!success) {
     PrintError("[GPTStepModel] Forward failed");
     return false;
@@ -549,7 +594,9 @@ int64_t GPTStepModel::GetSampledTokenGPU(GPTStepContext* ctx) {
 #endif
 }
 
-bool GPTStepModel::EnableGPUSampling(GPTStepContext* ctx, uint64_t seed) {
+bool GPTStepModel::EnableGPUSampling(GPTStepContext* ctx,
+                                     uint64_t seed,
+                                     BaseModel::InferenceLease* lease) {
 #ifdef WITH_CUDA
   if (!ctx) {
     PrintError("[GPTStepModel] Context is null");
@@ -562,7 +609,12 @@ bool GPTStepModel::EnableGPUSampling(GPTStepContext* ctx, uint64_t seed) {
     return false;
   }
 
-  if (model_device.stream) {
+  auto* lease_stream_ptr = m_model->GetLeaseStream(lease);
+  if (lease_stream_ptr) {
+    ctx->cuda_stream = static_cast<cudaStream_t>(lease_stream_ptr);
+    ctx->owns_stream = false;
+    PrintDebug("[GPTStepModel] Using request lease CUDA stream");
+  } else if (model_device.stream) {
     ctx->cuda_stream = static_cast<cudaStream_t>(model_device.stream);
     ctx->owns_stream = false;
     PrintDebug("[GPTStepModel] Using model's CUDA stream");

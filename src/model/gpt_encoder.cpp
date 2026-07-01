@@ -13,7 +13,8 @@ namespace GPTSoVITS::Model {
 GPTEncoderOutput GPTEncoderModel::Encode(
     Tensor* phoneme_ids,
     Tensor* prompts,
-    Tensor* bert_feature) {
+    Tensor* bert_feature,
+    BaseModel::InferenceLease* lease) {
 
   GPTEncoderOutput output;
 
@@ -75,7 +76,7 @@ GPTEncoderOutput GPTEncoderModel::Encode(
 
   // Run inference
   std::unordered_map<std::string, std::unique_ptr<Tensor>> outputs;
-  m_model->Forward(inputs, outputs);
+  m_model->ForwardWithLease(lease, inputs, outputs);
 
   // Extract outputs
   if (outputs.find("topk_values") != outputs.end()) {

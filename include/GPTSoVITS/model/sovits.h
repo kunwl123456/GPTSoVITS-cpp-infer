@@ -31,12 +31,6 @@ protected:
   int m_mel_bins = 128;
   int m_sv_dim = 512;  // Default for v2, Pro uses 20480
 
-  // 缓存标量输入 tensor
-  std::unique_ptr<Tensor> m_noise_scale_tensor;
-  std::unique_ptr<Tensor> m_speed_tensor;
-  float m_cached_noise_scale = -1.0f;
-  float m_cached_speed = -1.0f;
-
 public:
   SoVITSModel() = default;
   virtual ~SoVITSModel() = default;
@@ -82,7 +76,8 @@ public:
                               Tensor* refer_spec,
                               Tensor* sv_emb,
                               float noise_scale = 0.5f,
-                              float speed = 1.0f);
+                              float speed = 1.0f,
+                              BaseModel::InferenceLease* lease = nullptr);
 
   /**
    * @brief Run SoVITS inference returning Tensor
@@ -100,7 +95,8 @@ public:
                                          Tensor* refer_spec,
                                          Tensor* sv_emb,
                                          float noise_scale = 0.5f,
-                                         float speed = 1.0f);
+                                         float speed = 1.0f,
+                                         BaseModel::InferenceLease* lease = nullptr);
 
   /**
    * @brief Get sample rate
@@ -120,6 +116,7 @@ public:
   /**
    * @brief Get the underlying model
    */
+  [[nodiscard]] BaseModel* GetModel() { return m_model.get(); }
   [[nodiscard]] const BaseModel* GetModel() const { return m_model.get(); }
 };
 
