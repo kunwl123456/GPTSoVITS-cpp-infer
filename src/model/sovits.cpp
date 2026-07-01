@@ -19,7 +19,8 @@ std::unique_ptr<Tensor> SoVITSModel::GenerateTensor(Tensor* pred_semantic,
                                                     Tensor* refer_spec,
                                                     Tensor* sv_emb,
                                                     float noise_scale,
-                                                    float speed) {
+                                                    float speed,
+                                                    BaseModel::InferenceLease* lease) {
 
   // Ensure inputs are on the correct device and have correct types
   Device model_device = m_model->GetDevice();
@@ -82,30 +83,27 @@ std::unique_ptr<Tensor> SoVITSModel::GenerateTensor(Tensor* pred_semantic,
   }
 
   // Optional: noise_scale
+  std::unique_ptr<Tensor> noise_scale_tensor;
   if (has_input("noise_scale")) {
-    if (!m_noise_scale_tensor || m_cached_noise_scale != noise_scale) {
-      auto cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
-      cpu->At<float>(0) = noise_scale;
-      m_noise_scale_tensor = cpu->To(model_device, m_model->GetInputDataType("noise_scale"));
-      m_cached_noise_scale = noise_scale;
-    }
-    inputs["noise_scale"] = m_noise_scale_tensor.get();
+    auto cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
+    cpu->At<float>(0) = noise_scale;
+    noise_scale_tensor =
+        cpu->To(model_device, m_model->GetInputDataType("noise_scale"));
+    inputs["noise_scale"] = noise_scale_tensor.get();
   }
 
   // Optional: speed — 同上
+  std::unique_ptr<Tensor> speed_tensor;
   if (has_input("speed")) {
-    if (!m_speed_tensor || m_cached_speed != speed) {
-      auto cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
-      cpu->At<float>(0) = speed;
-      m_speed_tensor = cpu->To(model_device, m_model->GetInputDataType("speed"));
-      m_cached_speed = speed;
-    }
-    inputs["speed"] = m_speed_tensor.get();
+    auto cpu = Tensor::Empty({1}, DataType::kFloat32, Device(DeviceType::kCPU));
+    cpu->At<float>(0) = speed;
+    speed_tensor = cpu->To(model_device, m_model->GetInputDataType("speed"));
+    inputs["speed"] = speed_tensor.get();
   }
 
   // Run inference
   std::unordered_map<std::string, std::unique_ptr<Tensor>> outputs;
-  m_model->Forward(inputs, outputs);
+  m_model->ForwardWithLease(lease, inputs, outputs);
 
   // Extract audio output
   if (outputs.find("audio") != outputs.end()) {
@@ -121,9 +119,11 @@ std::vector<float> SoVITSModel::Generate(Tensor* pred_semantic,
                                           Tensor* refer_spec,
                                           Tensor* sv_emb,
                                           float noise_scale,
-                                          float speed) {
+                                          float speed,
+                                          BaseModel::InferenceLease* lease) {
 
-  auto audio_tensor = GenerateTensor(pred_semantic, text_seq, refer_spec, sv_emb, noise_scale, speed);
+  auto audio_tensor = GenerateTensor(
+      pred_semantic, text_seq, refer_spec, sv_emb, noise_scale, speed, lease);
 
   if (!audio_tensor) {
     return {};
