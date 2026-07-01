@@ -167,19 +167,17 @@ public:
                                     config.model_path, device,
                                     config.compute_precision);
     }
-    if (config.backend != Model::BackendType::kAuto
-        || !config.engine_cache_dir.empty()) {
-      auto group = config.mode == PipelineMode::kFull
-                       ? Model::ModelGroup::kAll
-                       : Model::ModelGroup::kInference;
-      for (auto type : Model::GetModelTypesInGroup(group)) {
-        model_pool.UpdateConfig(type, [&](Model::ModelConfig& cfg) {
-          if (config.backend != Model::BackendType::kAuto)
-            cfg.backend = config.backend;
-          if (!config.engine_cache_dir.empty())
-            cfg.engine_cache_dir = config.engine_cache_dir;
-        });
-      }
+    auto group = config.mode == PipelineMode::kFull
+                     ? Model::ModelGroup::kAll
+                     : Model::ModelGroup::kInference;
+    for (auto type : Model::GetModelTypesInGroup(group)) {
+      model_pool.UpdateConfig(type, [&](Model::ModelConfig& cfg) {
+        cfg.thread_num = config.thread_num;
+        if (config.backend != Model::BackendType::kAuto)
+          cfg.backend = config.backend;
+        if (!config.engine_cache_dir.empty())
+          cfg.engine_cache_dir = config.engine_cache_dir;
+      });
     }
     // 预加载模型
     if (config.mode == PipelineMode::kFull) {

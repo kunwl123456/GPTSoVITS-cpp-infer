@@ -94,6 +94,7 @@ public:
 
 private:
   struct Impl;
+  struct ContextSlot;
   std::unique_ptr<Impl> impl_;
 
   bool BuildFromONNX(const std::string& onnx_path, const TensorRTConfig& cfg);
@@ -102,7 +103,8 @@ private:
   void CollectIOMetadata();
   DataType DetermineInputType(DataType model_type) const;
 
-  bool InferCore(const std::unordered_map<std::string, Tensor*>& inputs,
+  bool InferCore(ContextSlot& slot,
+                 const std::unordered_map<std::string, Tensor*>& inputs,
                  const std::unordered_map<std::string, Tensor*>& outputs);
 };
 
